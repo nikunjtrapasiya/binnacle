@@ -1,0 +1,10 @@
+{
+  "name": "chartroom",
+  "description": "One page joining logbook's open obligations to the hail sessions that worked them",
+  "version": "0.4.3",
+  "author": { "name": "Nikunj Trapasiya" },
+  "homepage": "https://github.com/nikunjtrapasiya/binnacle",
+  "repository": "https://github.com/nikunjtrapasiya/binnacle",
+  "license": "MIT",
+  "keywords": ["sessions", "obligations", "ledger", "page", "handover"]
+}

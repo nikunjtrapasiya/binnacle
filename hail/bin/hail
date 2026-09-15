@@ -1,0 +1,1199 @@
+#!/usr/bin/env python3
+"""hail - find a past session and rejoin it.
+
+Builds an index over the Claude Code transcripts already on disk. The
+transcript format is not a published interface, so section 4 of the
+design puts two guards between a format change and an index of empty
+records.
+"""
+import calendar
+import datetime
+import hashlib
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+CONFIG_VERSION = 1
+VERSION = "0.2.4"
+
+# Bumped by hand whenever scan_file changes what it extracts. It is part
+# of the cache key, so a bump invalidates every cached record.
+EXTRACTOR_VERSION = 3
+
+DEFAULTS = {
+    "index": {"days": 10, "prompts": 2, "prompt_chars": 300},
+    "ticket": {
+        "pattern": r"[A-Z]{2,6}-\d{1,7}",
+        "reserved": ["ISO", "UTF", "SHA", "AES", "RGB", "RFC", "HTTP",
+                     "IPV"],
+    },
+    "scan": {
+        "transcripts": "~/.claude/projects",
+        "live": "~/.claude/sessions",
+        "min_sample": 5,
+        "min_bytes": 1048576,
+        "ignore_prefixes": [
+            "<command-", "<local-command", "<system-reminder", "Caveat:",
+            "Base directory for this skill", "The following skills",
+            "ARGUMENTS:", "This session is being continued",
+            "Note: /Users", "Result of calling", "Called the ",
+            "<bash-input", "<bash-stdout", "<ide-",
+            "[Request interrupted", "<task-notification",
+        ],
+    },
+}
+
+
+class Refused(Exception):
+    """Carries a message meant for the person who ran the command."""
+
+
+def config_path():
+    return os.path.expanduser("~/.claude/binnacle/hail.json")
+
+
+def type_ok(value, default):
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(default, list):
+        return isinstance(value, list) and all(
+            isinstance(v, str) for v in value)
+    return isinstance(value, type(default))
+
+
+def load_config(path=None):
+    import copy
+    cfg = copy.deepcopy(DEFAULTS)
+    source = {"path": path or config_path(), "fatal": None,
+              "warnings": [], "ticket_from": {"pattern": "default",
+                                              "reserved": "default"}}
+    try:
+        with open(source["path"]) as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        inherit_ticket(cfg, source)
+        return cfg, source
+    except (OSError, ValueError) as exc:
+        source["fatal"] = "config is unreadable: %s: %s" % (
+            source["path"], exc)
+        return cfg, source
+    if not isinstance(raw, dict):
+        source["fatal"] = "config is not an object: %s" % source["path"]
+        return cfg, source
+    if raw.get("version") != CONFIG_VERSION:
+        source["fatal"] = ("config version %r is not %d: %s"
+                           % (raw.get("version"), CONFIG_VERSION,
+                              source["path"]))
+        return cfg, source
+    for key, value in raw.items():
+        if key == "version":
+            continue
+        if key not in cfg:
+            source["warnings"].append("unknown config key ignored: %s" % key)
+            continue
+        if not isinstance(value, dict):
+            source["warnings"].append(
+                "config key %s must be an object, keeping the default" % key)
+            continue
+        for sub, subvalue in value.items():
+            if sub not in cfg[key]:
+                source["warnings"].append(
+                    "unknown config key ignored: %s.%s" % (key, sub))
+                continue
+            if not type_ok(subvalue, cfg[key][sub]):
+                source["warnings"].append(
+                    "config key %s.%s has the wrong type, keeping the "
+                    "default" % (key, sub))
+                continue
+            cfg[key][sub] = subvalue
+            if key == "ticket":
+                source["ticket_from"][sub] = "file"
+    inherit_ticket(cfg, source)
+    return cfg, source
+
+
+def inherit_ticket(cfg, source):
+    """Take ticket.pattern and ticket.reserved from logbook's config.
+
+    Never fatal. A logbook config logbook itself refuses is a config the
+    owner is not running under, so inheriting from it would adopt a
+    pattern nothing else is using.
+    """
+    path = os.path.expanduser("~/.claude/binnacle/logbook.json")
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        source["warnings"].append(
+            "logbook config unreadable, not inheriting: %s" % exc)
+        return
+    if not isinstance(raw, dict):
+        source["warnings"].append(
+            "logbook config is not an object, not inheriting")
+        return
+    if raw.get("version") != CONFIG_VERSION:
+        source["warnings"].append(
+            "logbook config version %r is not %d, not inheriting"
+            % (raw.get("version"), CONFIG_VERSION))
+        return
+    ticket = raw.get("ticket")
+    if not isinstance(ticket, dict):
+        return
+    for sub in ("pattern", "reserved"):
+        if sub not in ticket:
+            continue
+        if source["ticket_from"][sub] == "file":
+            continue        # hail's own value wins over an inherited one
+        if not type_ok(ticket[sub], DEFAULTS["ticket"][sub]):
+            source["warnings"].append(
+                "logbook ticket.%s has the wrong type, not inheriting" % sub)
+            continue
+        cfg["ticket"][sub] = ticket[sub]
+        source["ticket_from"][sub] = "inherited from logbook.json"
+
+
+def compile_ticket(pattern, warnings):
+    """Wrapped in word boundaries, as logbook wraps it (logbook:186).
+
+    Without them UTF-8 matches inside XUTF-8 and the reserved-prefix
+    check misfires.
+    """
+    try:
+        return re.compile(r"\b(?:%s)\b" % pattern)
+    except re.error as exc:
+        warnings.append("ticket.pattern does not compile, using the "
+                        "default: %s" % exc)
+    try:
+        return re.compile(r"\b(?:%s)\b" % DEFAULTS["ticket"]["pattern"])
+    except re.error:
+        return None
+
+
+def account_home():
+    """The account's own home from passwd, not whatever HOME says.
+
+    No expanduser fallback. logbook's equivalent (logbook:1150-1160)
+    falls back to expanduser on any exception, which honours HOME, and a
+    boundary with a HOME-shaped fallback is not a boundary. On Unix pwd
+    does not raise; if it somehow does, refuse rather than write
+    somewhere a repo could nominate.
+    """
+    try:
+        import pwd
+        return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception as exc:
+        raise Refused("cannot resolve the account home: %s" % exc)
+
+
+def index_path():
+    return os.path.join(account_home(), ".claude", "binnacle", "hail",
+                        "index.json")
+
+
+CFG, CONFIG_SOURCE = load_config()
+TICKET_RE = compile_ticket(CFG["ticket"]["pattern"],
+                           CONFIG_SOURCE["warnings"])
+
+UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def walk_transcripts(root):
+    """Main session transcripts only, which are one level down.
+
+    Sidechains live at <project>/<uuid>/subagents/agent-*.jsonl. On the
+    author's machine that is the difference between 186 files and 1650,
+    and indexing them fills find with prompts an agent generated rather
+    than anything the user typed. So the walk does not recurse.
+    """
+    try:
+        projects = sorted(os.listdir(root))
+    except OSError:
+        return
+    for project in projects:
+        pdir = os.path.join(root, project)
+        if not os.path.isdir(pdir):
+            continue
+        try:
+            names = sorted(os.listdir(pdir))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(pdir, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            yield project, path, st.st_mtime, st.st_size
+
+
+def _text_of(message):
+    """A user record's text, whether content is a string or blocks."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "".join(p for p in parts if isinstance(p, str))
+    return ""
+
+
+def _is_noise(text):
+    return any(text.startswith(p)
+               for p in CFG["scan"]["ignore_prefixes"])
+
+
+def _branch_tickets(branches):
+    """Ticket keys the branch names carry.
+
+    Split out from _tickets because a body mention may be incidental
+    and a consumer that means "worked on" needs to tell the two apart.
+    """
+    if TICKET_RE is None:
+        return []
+    reserved = set(CFG["ticket"]["reserved"])
+    found, seen = [], set()
+    for branch in branches:
+        for raw in TICKET_RE.findall(branch.upper()):
+            if raw.split("-", 1)[0] in reserved:
+                continue
+            if raw not in seen:
+                seen.add(raw)
+                found.append(raw)
+    return found
+
+
+def _tickets(branches, body):
+    """Branch keys first, then body keys by mention count.
+
+    The branch name is the strongest signal of what a session was for; a
+    body mention may be incidental.
+    """
+    if TICKET_RE is None:
+        return []
+    reserved = set(CFG["ticket"]["reserved"])
+
+    def keys(text):
+        found = []
+        for raw in TICKET_RE.findall(text.upper()):
+            if raw.split("-", 1)[0] in reserved:
+                continue
+            found.append(raw)
+        return found
+
+    ranked = _branch_tickets(branches)
+    seen = set(ranked)
+    counts = {}
+    for key in keys(body):
+        if key not in seen:
+            counts[key] = counts.get(key, 0) + 1
+    for key in sorted(counts, key=lambda k: (-counts[k], k)):
+        ranked.append(key)
+    return ranked
+
+
+def scan_file(path, project):
+    """One record, or None when the file has no user record at all."""
+    limit = CFG["index"]["prompt_chars"]
+    want = CFG["index"]["prompts"]
+    title = None
+    prs, branches = [], []
+    prompts, last_prompt = [], None
+    truncated_first = truncated_last = False
+    cwd = first_ts = last_ts = None
+    turns = 0
+    saw_user = False
+    body = []
+    try:
+        fh = open(path, errors="replace")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            if '"ai-title"' in line:
+                rec = _loads(line)
+                if isinstance(rec, dict) and isinstance(
+                        rec.get("aiTitle"), str) and rec["aiTitle"]:
+                    title = rec["aiTitle"]
+                continue
+            if '"pr-link"' in line:
+                rec = _loads(line)
+                if isinstance(rec, dict) and rec.get("prNumber") is not None:
+                    pr = {"number": rec.get("prNumber"),
+                          "repo": rec.get("prRepository"),
+                          "url": rec.get("prUrl")}
+                    if pr not in prs:
+                        prs.append(pr)     # the link line repeats per turn
+                continue
+            if ('"type":"user"' not in line
+                    and '"type": "user"' not in line):
+                continue
+            rec = _loads(line)
+            if not isinstance(rec, dict) or rec.get("type") != "user":
+                continue
+            if rec.get("isSidechain"):
+                continue
+            saw_user = True
+            # cwd and first_ts come from the first user record including
+            # a noise one: it carries the real directory and the real
+            # clock, and excluding noise would move both whenever the
+            # leading injections changed
+            if cwd is None and isinstance(rec.get("cwd"), str):
+                cwd = rec["cwd"]
+            if isinstance(rec.get("timestamp"), str):
+                if first_ts is None:
+                    first_ts = rec["timestamp"]
+                last_ts = rec["timestamp"]
+            branch = rec.get("gitBranch")
+            # "HEAD" means detached, not a branch named HEAD - keeping
+            # it would join unrelated checkouts under one fake branch
+            if (isinstance(branch, str) and branch and branch != "HEAD"
+                    and branch not in branches):
+                branches.append(branch)
+            text = _text_of(rec.get("message"))
+            if not text or _is_noise(text):
+                continue
+            turns += 1
+            body.append(text)
+            cut = text[:limit]
+            if len(prompts) < want:
+                prompts.append(cut)
+                truncated_first = truncated_first or len(cut) < len(text)
+            else:
+                last_prompt = cut
+                truncated_last = len(cut) < len(text)
+    if not saw_user:
+        # a flag, not a conjunction over the extracted fields: a noise
+        # record carrying none of cwd, timestamp or gitBranch is still a
+        # user record, and misfiling it as no_user_records would hide a
+        # format change behind a routine counter
+        return None
+    record = {
+        "id": os.path.basename(path)[:-len(".jsonl")],
+        "project": project,
+        "path": path,
+        "cwd": cwd,
+        "branches": branches,
+        "tickets": _tickets(branches, "\n".join(body)),
+        "tickets_from_branch": _branch_tickets(branches),
+        "prs": prs,
+        "prompts": prompts,
+        "prompts_truncated": truncated_first,
+        "turns": turns,
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+    }
+    if title is not None:
+        record["title"] = title
+    if last_prompt is not None:
+        record["last_prompt"] = last_prompt
+        record["last_prompt_truncated"] = truncated_last
+    return record
+
+
+def _loads(line):
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
+def record_ok(record):
+    """True, or a string saying why the record is not written.
+
+    logbook's brief prints `rejoin: cd <cwd> && claude -r <id>` into the
+    session-start context (logbook:647, logbook:851), so these two
+    fields reach another plugin's output unescaped.
+    """
+    if not UUID_RE.match(record.get("id") or ""):
+        return "id is not a session uuid: %r" % record.get("id")
+    cwd = record.get("cwd")
+    if not isinstance(cwd, str) or not os.path.isabs(cwd):
+        return "cwd is not an absolute path: %r" % cwd
+    if CONTROL_RE.search(cwd):
+        return "cwd carries a control character"
+    return True
+
+
+def write_index(payload):
+    """Atomically, at 0600, to the one path config cannot move."""
+    target = index_path()
+    if os.path.islink(target):
+        raise Refused("refusing to write through a symlink: %s" % target)
+    parent = os.path.dirname(target)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    # mkstemp, not a fixed index.json.tmp: it opens O_CREAT|O_EXCL on a
+    # name nothing can predict, so neither a planted symlink nor a
+    # leftover temp file from a killed run can redirect or block this.
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix="index.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(payload, fh, indent=1, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def scan_signature():
+    """A hash over everything that shapes a record.
+
+    sort_keys is not cosmetic: without a canonical serialisation two
+    runs on identical config can disagree, which is a full rescan on
+    every session start and nothing to show for it.
+
+    index.days is deliberately absent. It decides which files are
+    looked at, not what a record contains.
+    """
+    material = {
+        "extractor": EXTRACTOR_VERSION,
+        "pattern": CFG["ticket"]["pattern"],
+        "reserved": CFG["ticket"]["reserved"],
+        "ignore_prefixes": CFG["scan"]["ignore_prefixes"],
+        "prompts": CFG["index"]["prompts"],
+        "prompt_chars": CFG["index"]["prompt_chars"],
+    }
+    blob = json.dumps(material, sort_keys=True).encode("utf-8")
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def load_index():
+    """The index as written, or None. Never raises on a bad file."""
+    try:
+        with open(index_path()) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError, Refused):
+        return None
+    if not isinstance(data, dict) or not isinstance(
+            data.get("sessions"), list):
+        return None
+    return data
+
+
+# Compared as sets, so a reordering is not a regression. prompts and
+# last_prompt are absent on purpose: last_prompt is meant to move.
+SUPERSET_LISTS = ("branches", "prs", "tickets", "tickets_from_branch")
+
+
+def superset_violation(cached, fresh):
+    """None when the rescan lost nothing, else the field that shrank.
+
+    Transcripts are append-only, so a rescan of an already-indexed file
+    cannot legitimately lose anything. One file that does is a format
+    regression, caught at sample size one on the first rescan after a
+    bad update.
+
+    The caller must only compare records built under the same
+    scan_signature. Under a changed signature a shrink is legitimate:
+    narrowing the ticket pattern shrinks tickets, adding an ignore
+    prefix shrinks turns.
+    """
+    if fresh.get("cwd") != cached.get("cwd"):
+        return "cwd"
+    if "title" in cached and "title" not in fresh:
+        return "title"
+    if fresh.get("first_ts") != cached.get("first_ts"):
+        return "first_ts"
+    if (fresh.get("turns") or 0) < (cached.get("turns") or 0):
+        return "turns"
+    for field in SUPERSET_LISTS:
+        was = _members(cached.get(field))
+        now = _members(fresh.get(field))
+        if not was <= now:
+            return field
+    return None
+
+
+def _members(value):
+    """Hashable members of a record list, whatever it holds.
+
+    prs holds dicts, so the set is built from a stable serialisation.
+    """
+    if not isinstance(value, list):
+        return frozenset()
+    out = set()
+    for item in value:
+        if isinstance(item, (dict, list)):
+            out.add(json.dumps(item, sort_keys=True))
+        else:
+            out.add(item)
+    return out
+
+
+CENSUS_FIELDS = ("fresh", "reused", "aged_off", "no_user_records",
+                 "user_records_no_cwd", "kept_on_regression", "refused",
+                 "superseded", "titles", "tickets", "prs", "branches")
+
+# Fields ls --json may emit. Everything a machine consumer legitimately
+# needs, minus prompt text (prompts, last_prompt and their truncation
+# flags) and the transcript's on-disk path - show is the command that
+# prints those, and this one must not become a bulk export of them.
+LS_JSON_FIELDS = (
+    "id", "project", "cwd", "branches", "tickets", "tickets_from_branch",
+    "prs", "turns", "first_ts", "last_ts", "title", "mtime", "size",
+)
+
+
+def newest_per_id(root, census):
+    """One file per session id, the most recently modified.
+
+    A session id is not unique across project directories: resuming a
+    session from another checkout writes a second transcript under the
+    new project with the same id. Both are real files and the older one
+    is a superseded copy. Without this, two records share an id, which
+    breaks three things at once. The index promises one record per id
+    and logbook resolves a rejoin by taking the first prefix match, so
+    which directory it names would depend on list order. `show` would
+    call a single session ambiguous. And the guard would compare one
+    file against the other's cached record, report a regression that is
+    not one, keep the stale record, and (since a kept record keeps its
+    cached mtime) do it again on every run forever.
+    """
+    newest = {}
+    for project, path, mtime, size in walk_transcripts(root):
+        sid = os.path.basename(path)[:-len(".jsonl")]
+        if sid not in newest or mtime > newest[sid][2]:
+            if sid in newest:
+                census["superseded"] += 1
+            newest[sid] = (project, path, mtime, size)
+        else:
+            census["superseded"] += 1
+    return list(newest.values())
+
+
+def build(days=None, force=False):
+    """(payload, census, refusal). Nothing is written here.
+
+    refusal is a message when the cold check fired, in which case the
+    caller must leave the existing index exactly as it is.
+    """
+    root = os.path.expanduser(CFG["scan"]["transcripts"])
+    if not os.path.isdir(root):
+        return None, dict.fromkeys(CENSUS_FIELDS, 0), None
+    window = CFG["index"]["days"] if days is None else days
+    cutoff = time.time() - window * 86400
+    signature = scan_signature()
+    previous = load_index() or {}
+    comparable = previous.get("scan_signature") == signature
+    cached = {}
+    for record in previous.get("sessions") or []:
+        if isinstance(record, dict) and isinstance(record.get("id"), str):
+            cached[record["id"]] = record
+
+    census = dict.fromkeys(CENSUS_FIELDS, 0)
+    records, fresh_bytes = [], 0
+    for project, path, mtime, size in newest_per_id(root, census):
+        if mtime < cutoff:
+            census["aged_off"] += 1
+            continue
+        sid = os.path.basename(path)[:-len(".jsonl")]
+        prior = cached.get(sid)
+        if (not force and prior and comparable
+                and prior.get("mtime") == mtime
+                and prior.get("size") == size):
+            census["reused"] += 1
+            records.append(prior)
+            continue
+        census["fresh"] += 1
+        fresh_bytes += size
+        record = scan_file(path, project)
+        if record is None:
+            census["no_user_records"] += 1
+            continue
+        # part one runs before the no-cwd exclusion: otherwise a cwd key
+        # rename drops every file out of the run before anything can
+        # notice, which is the failure the guard exists for
+        if prior and comparable and not force:
+            field = superset_violation(prior, record)
+            if field is not None:
+                census["kept_on_regression"] += 1
+                # the cached mtime and size are kept on purpose, so this
+                # file is rescanned and re-reported on every run rather
+                # than reused from cache and going quiet
+                records.append(prior)
+                continue
+        if record.get("cwd") is None:
+            census["user_records_no_cwd"] += 1
+            continue
+        verdict = record_ok(record)
+        if verdict is not True:
+            census["refused"] += 1
+            continue
+        record["mtime"] = mtime
+        record["size"] = size
+        records.append(record)
+
+    # over every record that will be written, not only the fresh ones.
+    # So the cold check can fire only when nothing reusable with a cwd
+    # exists, which is a genuine cold path: a warm run where a few fresh
+    # files lack cwd counts them in user_records_no_cwd and the hook
+    # says so, rather than refusing a build that is mostly fine.
+    with_cwd = sum(1 for r in records if r.get("cwd"))
+    if (census["fresh"] >= CFG["scan"]["min_sample"]
+            and fresh_bytes >= CFG["scan"]["min_bytes"]
+            and with_cwd == 0):
+        return None, census, (
+            "scanned %d transcripts (%d bytes) and not one carried a cwd. "
+            "The transcript format has probably changed. Looking for: "
+            "type=user records with cwd, gitBranch and timestamp. "
+            "The index was left alone." % (census["fresh"], fresh_bytes))
+
+    records.sort(key=lambda r: r.get("mtime") or 0, reverse=True)
+    census["titles"] = sum(1 for r in records if r.get("title"))
+    census["tickets"] = sum(1 for r in records if r.get("tickets"))
+    census["prs"] = sum(1 for r in records if r.get("prs"))
+    census["branches"] = sum(1 for r in records if r.get("branches"))
+    payload = {
+        "version": 1,
+        "built_at": datetime.datetime.now(
+            datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "days": window,
+        "scan_signature": signature,
+        "census": census,
+        "sessions": records,
+    }
+    return payload, census, None
+
+
+def cmd_index(args):
+    days, force = None, False
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--force":
+            force = True
+        elif arg == "--days":
+            if not rest:
+                print("--days needs a number", file=sys.stderr)
+                return 2
+            try:
+                days = int(rest.pop(0))
+            except ValueError:
+                print("--days needs a number", file=sys.stderr)
+                return 2
+            if days < 1:
+                print("--days must be 1 or more", file=sys.stderr)
+                return 2
+        else:
+            print("unknown argument: %s" % arg, file=sys.stderr)
+            return 2
+
+    payload, census, refusal = build(days=days, force=force)
+    if refusal:
+        print("refused: %s" % refusal, file=sys.stderr)
+        return 5
+    if payload is None:
+        print("no transcripts directory at %s, nothing written"
+              % os.path.expanduser(CFG["scan"]["transcripts"]))
+        return 0
+    write_index(payload)
+    print("indexed %d sessions: %s" % (
+        len(payload["sessions"]),
+        ", ".join("%s %d" % (k, census[k]) for k in CENSUS_FIELDS
+                  if census[k])))
+    if census["kept_on_regression"]:
+        print("kept %d cached record(s): a rescan lost fields it had "
+              "before. Run hail doctor." % census["kept_on_regression"])
+    if census["user_records_no_cwd"]:
+        print("%d transcript(s) had user records but no cwd. Run hail "
+              "doctor." % census["user_records_no_cwd"])
+    return 0
+
+
+# The two clocks differ by the machine's UTC offset, and startedAt in
+# the same file agreed with the UTC reading to the second in the sample,
+# so a few seconds is the whole of the slack needed.
+PROC_START_TOLERANCE = 5.0
+
+
+def _ctime_epoch(text):
+    """A ctime string read as UTC, whatever zone this process is in."""
+    return calendar.timegm(time.strptime(text.strip(),
+                                         "%a %b %d %H:%M:%S %Y"))
+
+
+def process_start(pids):
+    """{pid: epoch} from one ps call, with the child forced to UTC.
+
+    procStart in the sessions file is a ctime string in UTC; ps prints
+    lstart in local time. Forcing TZ in the child puts both in the same
+    zone, and parsing to epochs means a zone change between writing the
+    file and reading it cannot matter either.
+    """
+    pids = sorted(set(pids))
+    if not pids:
+        return {}
+    env = dict(os.environ)
+    env["TZ"] = "UTC"
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=,lstart=", "-p",
+             ",".join(str(p) for p in pids)],
+            capture_output=True, text=True, timeout=5, env=env).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    started = {}
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) != 2:
+            continue
+        try:
+            started[int(parts[0])] = _ctime_epoch(parts[1])
+        except ValueError:
+            continue
+    return started
+
+
+def live_session_ids():
+    """Session ids whose process is still the one that wrote the file.
+
+    Returns (live_ids, no_proc_start) so doctor can report how many
+    sessions files carried no procStart, as spec section 7 requires.
+    """
+    root = os.path.expanduser(CFG["scan"]["live"])
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return set(), 0
+    claims = []
+    no_proc_start = 0
+    for name in sorted(names):
+        if not name.endswith(".json"):
+            continue                 # the directory also holds *.key
+        try:
+            with open(os.path.join(root, name)) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        pid = data.get("pid")
+        sid = data.get("sessionId")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+            continue
+        if not isinstance(sid, str) or not sid:
+            continue
+        if not isinstance(data.get("procStart"), str):
+            # absent is not a pass: an older Claude Code may not write
+            # it, and treating absent as live restores the pid reuse
+            # hole the field exists to close
+            no_proc_start += 1
+            continue
+        claims.append((pid, sid, data["procStart"]))
+
+    running = process_start([pid for pid, _, _ in claims])
+    live = set()
+    for pid, sid, claimed in claims:
+        # a pid that exited between the listdir and the ps call is
+        # simply absent from running, which reads as not live
+        actual = running.get(pid)
+        if actual is None:
+            continue
+        try:
+            want = _ctime_epoch(claimed)
+        except ValueError:
+            continue
+        if abs(actual - want) <= PROC_START_TOLERANCE:
+            live.add(sid)
+    return live, no_proc_start
+
+
+def _ticket_key(query):
+    """The query as a ticket key, or None.
+
+    Upper-cased it must fullmatch the wrapped pattern and its prefix
+    must not be reserved. A query that merely contains a key is not one:
+    it goes to the substring search instead.
+    """
+    if TICKET_RE is None:
+        return None
+    key = query.strip().upper()
+    if not TICKET_RE.fullmatch(key):
+        return None
+    if key.split("-", 1)[0] in set(CFG["ticket"]["reserved"]):
+        return None
+    return key
+
+
+def _haystack(record):
+    parts = [record.get("title") or "", record.get("cwd") or "",
+             record.get("last_prompt") or ""]
+    parts.extend(record.get("branches") or [])
+    parts.extend(record.get("prompts") or [])
+    for pr in record.get("prs") or []:
+        if isinstance(pr, dict):
+            parts.append(str(pr.get("number")))
+            parts.append(pr.get("repo") or "")
+    return "\n".join(parts).lower()
+
+
+def _matches(record, query):
+    key = _ticket_key(query)
+    if key is not None:
+        return key in (record.get("tickets") or [])
+    return query.lower() in _haystack(record)
+
+
+def _need_index():
+    data = load_index()
+    if data is None:
+        print("no index yet. Run: hail index")
+    return data
+
+
+def _line(record, live):
+    """One session, one line. See spec section 1."""
+    age = record.get("last_ts") or ""
+    label = record.get("title")
+    if not label:
+        prompts = record.get("prompts") or []
+        label = prompts[0] if prompts else (record.get("last_prompt") or "")
+    return "%s%s  %-10s %-22s %-24s %s" % (
+        "*" if record.get("id") in live else " ",
+        (record.get("id") or "")[:8],
+        age[:10],
+        (record.get("tickets") or ["-"])[0],
+        (record.get("branches") or ["-"])[0][:24],
+        flat(label))
+
+
+def flat(value):
+    """One line, and never able to start one."""
+    return " ".join(str(value or "").split())
+
+
+def cmd_find(args):
+    n = 15
+    as_json = False
+    rest = list(args)
+    query_parts = []
+    while rest:
+        arg = rest.pop(0)
+        if arg == "-n":
+            if not rest:
+                print("-n needs a number", file=sys.stderr)
+                return 2
+            try:
+                n = int(rest.pop(0))
+            except ValueError:
+                print("-n needs a number", file=sys.stderr)
+                return 2
+        elif arg == "--json":
+            as_json = True
+        else:
+            query_parts.append(arg)
+    query = " ".join(query_parts)
+    if not query:
+        print("usage: hail find <query> [--json] [-n N]",
+              file=sys.stderr)
+        return 2
+
+    data = _need_index()
+    if data is None:
+        return 1
+    live, _ = live_session_ids()
+    results = [r for r in data["sessions"] if _matches(r, query)][:n]
+    if as_json:
+        print(json.dumps(results, indent=1))
+    else:
+        for record in results:
+            print(_line(record, live))
+    return 0 if results else 1
+
+
+def cmd_ls(args):
+    n = 10
+    as_json = False
+    rest = list(args)
+    while rest:
+        arg = rest.pop(0)
+        if arg == "-n":
+            if not rest:
+                print("-n needs a number", file=sys.stderr)
+                return 2
+            try:
+                n = int(rest.pop(0))
+            except ValueError:
+                print("-n needs a number", file=sys.stderr)
+                return 2
+        elif arg == "--json":
+            as_json = True
+        else:
+            print("unknown argument: %s" % arg, file=sys.stderr)
+            return 2
+
+    if as_json:
+        if "-n" in args:
+            print("-n means nothing with --json, which returns every "
+                  "record. A truncated index is a page that lies.",
+                  file=sys.stderr)
+            return 2
+        return _ls_json()
+
+    data = _need_index()
+    if data is None:
+        return 1
+    live, _ = live_session_ids()
+    records = data["sessions"][:n]
+    for record in records:
+        print(_line(record, live))
+    if any(record.get("id") in live for record in records):
+        print("* live")
+    return 0
+
+
+def _ls_json():
+    """The envelope, for a machine. Refusals go to stderr.
+
+    Each session is trimmed to LS_JSON_FIELDS before printing - not the
+    stored record whole, which would export every prompt ever typed
+    into the session. `show` is where prompt text belongs.
+
+    load_index returns None for a corrupt file exactly as for a missing
+    one, so the two are told apart by a stat before it is called:
+    telling someone to rebuild an index that exists and is corrupt is
+    advice that happens to work for the wrong reason.
+    """
+    path = index_path()
+    if not os.path.exists(path):
+        print("no index yet. Run: hail index", file=sys.stderr)
+        return 1
+    data = load_index()
+    if data is None:
+        print("index at %s is unreadable. Run: hail index" % path,
+              file=sys.stderr)
+        return 1
+    sessions = data.get("sessions") or []
+    if any("tickets_from_branch" not in r for r in sessions):
+        print("index predates this hail. Run: hail index",
+              file=sys.stderr)
+        return 1
+    trimmed = [{k: r[k] for k in LS_JSON_FIELDS if k in r}
+               for r in sessions]
+    print(json.dumps({
+        "version": data.get("version"),
+        "built_at": data.get("built_at"),
+        "days": data.get("days"),
+        "census": data.get("census") or {},
+        "sessions": trimmed,
+    }, indent=1))
+    return 0
+
+
+def cmd_show(args):
+    if not args:
+        print("usage: hail show <id-or-prefix>", file=sys.stderr)
+        return 2
+    prefix = args[0]
+    if len(prefix) < 6:
+        print("prefix must be at least six characters", file=sys.stderr)
+        return 2
+
+    data = _need_index()
+    if data is None:
+        return 1
+    live, _ = live_session_ids()
+    candidates = [r for r in data["sessions"]
+                  if (r.get("id") or "").startswith(prefix)]
+    if not candidates:
+        print("no session matches %s" % prefix)
+        return 1
+    if len(candidates) > 1:
+        print("ambiguous prefix %s matches:" % prefix)
+        for record in candidates:
+            print(record.get("id"))
+            print(_line(record, live))
+        return 2
+
+    record = candidates[0]
+    session_id = record.get("id")
+    print(session_id)
+    if record.get("title"):
+        print("title: %s" % flat(record["title"]))
+    print("cwd: %s" % (record.get("cwd") or "-"))
+    print("branches: %s" % ", ".join(record.get("branches") or ["-"]))
+    print("tickets: %s" % ", ".join(record.get("tickets") or ["-"]))
+    prs = record.get("prs") or []
+    if prs:
+        for pr in prs:
+            print("pr: %s#%s %s" % (pr.get("repo"), pr.get("number"),
+                                    pr.get("url") or ""))
+    else:
+        print("prs: -")
+    print("turns: %s" % record.get("turns"))
+    print("first_ts: %s" % (record.get("first_ts") or "-"))
+    print("last_ts: %s" % (record.get("last_ts") or "-"))
+    print("live: %s" % ("yes" if session_id in live else "no"))
+    for prompt in record.get("prompts") or []:
+        print("prompt: %s" % flat(prompt))
+    if record.get("last_prompt"):
+        print("last_prompt: %s" % flat(record["last_prompt"]))
+    print("cd %s && claude -r %s" % (shlex.quote(record.get("cwd") or ""),
+                                     session_id))
+    return 0
+
+
+def logbook_index_path():
+    """What logbook's config says it reads, expanded, or None.
+
+    The one value hail reads from logbook's file besides ticket. Spec
+    section 5 names this exception, because a second reader creeping in
+    later is how a config file stops having an owner.
+    """
+    try:
+        with open(os.path.expanduser(
+                "~/.claude/binnacle/logbook.json")) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != CONFIG_VERSION:
+        return None
+    hail = raw.get("hail")
+    if not isinstance(hail, dict) or not isinstance(hail.get("index"), str):
+        return None
+    # realpath, because index_path() is a realpath: on a home reached
+    # through a symlink the same file has two spellings and an
+    # unresolved compare reports a mismatch that is not one
+    return os.path.realpath(os.path.expanduser(hail["index"]))
+
+
+# No existing config setting says how old is too old, so this is a
+# heuristic default rather than a value read from anywhere.
+STALE_INDEX_SECONDS = 7 * 86400
+
+
+def cmd_doctor(args):
+    """Settings in force, scan health, and the logbook path mismatch.
+
+    Must run under a fatal config: it is the one command a broken
+    hail.json cannot silence, so the fatal check comes first and short
+    circuits everything else.
+    """
+    path = CONFIG_SOURCE["path"]
+    print("config: %s (%s)" % (
+        path, "exists" if os.path.exists(path) else "absent"))
+    if CONFIG_SOURCE["fatal"]:
+        print("fatal: %s" % CONFIG_SOURCE["fatal"])
+        return 4
+
+    for section in ("index", "scan"):
+        for sub in DEFAULTS[section]:
+            source = ("file" if CFG[section][sub] != DEFAULTS[section][sub]
+                      else "default")
+            print("%s.%s: %s" % (section, sub, source))
+    for sub in ("pattern", "reserved"):
+        print("ticket.%s: %s" % (sub, CONFIG_SOURCE["ticket_from"][sub]))
+
+    for warning in CONFIG_SOURCE["warnings"]:
+        print("warning: %s" % warning)
+
+    findings = []
+
+    idx_path = None
+    try:
+        idx_path = index_path()
+    except Refused as exc:
+        print("index: refused: %s" % exc)
+    else:
+        print("index: %s" % idx_path)
+
+    logbook_index = logbook_index_path()
+    if (logbook_index is not None and idx_path is not None
+            and logbook_index != idx_path):
+        findings.append(
+            "logbook.json hail.index names a path hail does not "
+            "write: %s" % logbook_index)
+
+    census = {}
+    if idx_path is not None:
+        try:
+            st = os.stat(idx_path)
+        except OSError:
+            print("index not built yet")
+        else:
+            age = time.time() - st.st_mtime
+            print("index mode: %04o" % stat.S_IMODE(st.st_mode))
+            print("index size: %d bytes" % st.st_size)
+            print("index age: %ds" % int(age))
+            if age > STALE_INDEX_SECONDS:
+                findings.append(
+                    "index is %ds old, over the %ds staleness "
+                    "threshold - every answer built on it may be "
+                    "stale" % (int(age), STALE_INDEX_SECONDS))
+        data = load_index()
+        census = (data or {}).get("census") or {}
+    print("census: %s" % json.dumps(census, sort_keys=True))
+
+    kept = census.get("kept_on_regression") or 0
+    if kept:
+        findings.append("kept %d record(s) on regression" % kept)
+    no_cwd = census.get("user_records_no_cwd") or 0
+    if no_cwd:
+        findings.append("%d user record(s) with no cwd" % no_cwd)
+
+    _, no_proc_start = live_session_ids()
+    print("sessions files with no procStart: %d" % no_proc_start)
+
+    print("extraction table: aiTitle, pr-link, type/isSidechain, cwd, "
+          "gitBranch, timestamp")
+
+    for finding in findings:
+        print("finding: %s" % finding)
+
+    return 1 if findings else 0
+
+
+COMMANDS = {
+    "index": cmd_index,
+    "find": cmd_find,
+    "ls": cmd_ls,
+    "show": cmd_show,
+    "doctor": cmd_doctor,
+}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] == "--version":
+        # before the fatal-config check on purpose: chartroom's
+        # detection must work on an installation that is otherwise
+        # refusing to run
+        print(VERSION)
+        return 0
+    if not argv or argv[0] not in COMMANDS:
+        print("usage: hail {index,find,ls,show,doctor} ...",
+              file=sys.stderr)
+        return 2
+    command = argv[0]
+    if CONFIG_SOURCE["fatal"] and command != "doctor":
+        print("hail: %s" % CONFIG_SOURCE["fatal"], file=sys.stderr)
+        return 4
+    return COMMANDS[command](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

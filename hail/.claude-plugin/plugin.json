@@ -1,0 +1,10 @@
+{
+  "name": "hail",
+  "description": "Find a past session by ticket, branch, title, directory or what you typed into it, and rejoin it",
+  "version": "0.2.4",
+  "author": { "name": "Nikunj Trapasiya" },
+  "homepage": "https://github.com/nikunjtrapasiya/binnacle",
+  "repository": "https://github.com/nikunjtrapasiya/binnacle",
+  "license": "MIT",
+  "keywords": ["sessions", "index", "search", "resume", "transcripts"]
+}

@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact|resume|fork",
+        "hooks": [
+          { "type": "command",
+            "timeout": 60,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/hail-index.py\"" }
+        ]
+      }
+    ]
+  }
+}

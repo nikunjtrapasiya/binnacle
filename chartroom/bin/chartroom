@@ -1,0 +1,1761 @@
+#!/usr/bin/env python3
+"""chartroom: one page over logbook and hail.
+
+Reads both siblings over their documented --json output, joins what is
+owed to the sessions that worked it, and writes one self-contained HTML
+page. Read-only against both.
+"""
+import copy
+import datetime
+import hmac
+import html
+import http.server
+import json
+import os
+import secrets
+import shlex
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import webbrowser
+
+VERSION = "0.4.3"
+CONFIG_VERSION = 1
+# Per tool, because they move apart. logbook 0.3.0 is the release that
+# reports its own kinds, and without that this page cannot say which
+# obligations block and which are only on record.
+SIBLING_FLOOR = {"logbook": (0, 3, 0), "hail": (0, 2, 0)}
+
+DEFAULTS = {
+    "version": 1,
+    "page": {
+        "path": "~/.claude/binnacle/chartroom/chartroom.html",
+        "open": True,
+    },
+    "sort": {"by": "age", "dir": "asc"},
+    "rows": {"only_open": True, "blocking_only": True},
+    "sessions": {"limit": 60},
+    "serve": {"port": 8787, "open": True},
+    "tools": {
+        "logbook": "logbook",
+        "hail": "hail",
+        "timeout_seconds": 20,
+    },
+}
+
+SORT_KEYS = ("key", "open", "sessions", "age")
+SORT_DIRS = ("asc", "desc")
+
+
+class Refused(Exception):
+    """Carries the exit code chartroom should return."""
+
+    def __init__(self, code, message):
+        Exception.__init__(self, message)
+        self.code = code
+
+
+def account_home():
+    """The account's own home from passwd, not whatever HOME says.
+
+    No expanduser fallback, because the config this locates names the
+    executables chartroom runs. A repointed HOME would let anything
+    that can set an environment variable choose the binary. Both
+    siblings draw the same boundary; a boundary with a HOME-shaped
+    fallback is not one.
+    """
+    try:
+        import pwd
+        return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception as exc:
+        raise Refused(2, "cannot resolve the account home: %s" % exc)
+
+
+def expand_home(path):
+    return os.path.expanduser(path)
+
+
+def config_path():
+    return os.path.expanduser("~/.claude/binnacle/chartroom.json")
+
+
+def config_is_trusted(path):
+    """Whether this config may choose the binaries chartroom runs.
+
+    tools.* names an executable, so honouring it from a file outside
+    the account's own home would let anything that can set HOME, or
+    plant a symlink on the path, choose what runs. Everything else in
+    the config only shapes a page and is honoured wherever it is
+    found; both siblings draw the same line in the same place.
+    """
+    try:
+        home = account_home()
+    except Refused:
+        return False
+    real = os.path.realpath(path)
+    return real == home or real.startswith(home + os.sep)
+
+
+def type_ok(value, default):
+    """Same shape as the default. A default of None also accepts a
+    plain int - that slot's absence is itself a meaningful setting,
+    not just unset."""
+    if default is None:
+        return value is None or (
+            isinstance(value, int) and not isinstance(value, bool))
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, type(default))
+
+
+def load_config(path=None):
+    cfg = copy.deepcopy(DEFAULTS)
+    source = {"path": path or config_path(), "fatal": None, "warnings": []}
+    try:
+        with open(source["path"]) as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return cfg, source
+    except (OSError, ValueError) as exc:
+        source["fatal"] = "config is unreadable: %s: %s" % (
+            source["path"], exc)
+        return cfg, source
+    if not isinstance(raw, dict):
+        source["fatal"] = "config is not an object: %s" % source["path"]
+        return cfg, source
+    if raw.get("version") != CONFIG_VERSION:
+        source["fatal"] = ("config version %r is not %d: %s"
+                           % (raw.get("version"), CONFIG_VERSION,
+                              source["path"]))
+        return cfg, source
+    for key, value in raw.items():
+        if key == "version":
+            continue
+        if key not in cfg:
+            source["warnings"].append("unknown config key ignored: %s" % key)
+            continue
+        if not isinstance(value, dict):
+            source["warnings"].append(
+                "config key %s must be an object, keeping the default"
+                % key)
+            continue
+        for sub, subvalue in value.items():
+            if sub not in cfg[key]:
+                source["warnings"].append(
+                    "unknown config key ignored: %s.%s" % (key, sub))
+                continue
+            if not type_ok(subvalue, cfg[key][sub]):
+                source["warnings"].append(
+                    "config key %s.%s has the wrong type, keeping the "
+                    "default" % (key, sub))
+                continue
+            cfg[key][sub] = subvalue
+    named = [t for t in ("logbook", "hail")
+             if (raw.get("tools") or {}).get(t)]
+    if named and not config_is_trusted(source["path"]):
+        for tool in named:
+            cfg["tools"][tool] = DEFAULTS["tools"][tool]
+        source["warnings"].append(
+            "tools.%s ignored: %s is not inside the account's own home, "
+            "so it may not choose which binaries run"
+            % (", tools.".join(named), source["path"]))
+    return cfg, source
+
+
+CFG, CONFIG_SOURCE = load_config()
+
+
+def _command(tool):
+    """The binary to run for a sibling.
+
+    A bare name goes through PATH. An absolute path is the operator
+    saying exactly which file they mean. A relative path resolves
+    against whatever directory chartroom was started in, which is a
+    repository often enough to be worth refusing outright.
+    """
+    command = CFG["tools"][tool]
+    if os.sep in command and not os.path.isabs(command):
+        raise Refused(2, "tools.%s is a relative path: %s. Use a bare "
+                         "name to search PATH, or an absolute path."
+                      % (tool, command))
+    return command
+
+
+def _run(tool, args):
+    try:
+        return subprocess.run(
+            [_command(tool)] + args,
+            capture_output=True, text=True,
+            timeout=CFG["tools"]["timeout_seconds"])
+    except FileNotFoundError:
+        raise Refused(4, "%s is not on PATH. A marketplace install puts "
+                         "it on PATH inside a Claude Code session only, "
+                         "so from a plain terminal set tools.%s in %s to "
+                         "its absolute path. If it is not installed at "
+                         "all: /plugin install %s@binnacle"
+                      % (tool, tool, CONFIG_SOURCE["path"], tool))
+    except subprocess.TimeoutExpired:
+        raise Refused(5, "%s did not answer within %ds. Raise "
+                         "tools.timeout_seconds in %s, or check whether "
+                         "%s is stuck."
+                      % (tool, CFG["tools"]["timeout_seconds"],
+                         CONFIG_SOURCE["path"], tool))
+
+
+def _parse_version(text):
+    """The first line of stdout, or None.
+
+    Pinned rather than guessed: a builder choosing their own grammar
+    here is a builder deciding which installations chartroom refuses.
+    """
+    first = (text or "").strip().splitlines()
+    if not first:
+        return None
+    parts = first[0].strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
+
+
+def check_version(tool):
+    floor = SIBLING_FLOOR[tool]
+    out = _run(tool, ["--version"])
+    got = _parse_version(out.stdout) if out.returncode == 0 else None
+    if got is None or got < floor:
+        raise Refused(4, "%s is older than %s, or cannot report a "
+                         "version. Upgrade it: /plugin update %s@binnacle"
+                      % (tool, ".".join(str(n) for n in floor), tool))
+    return got
+
+
+# What each envelope must carry for the page to mean anything. The
+# version check is a floor with no ceiling, so without this a future
+# sibling that renames a key parses fine and renders "0 open" - the
+# worst available answer from a tool whose whole claim is what is
+# outstanding, and indistinguishable from an empty ledger.
+ENVELOPE = {
+    "logbook": (("entries", list), ("thresholds", dict), ("kinds", dict)),
+    "hail": (("sessions", list), ("census", dict)),
+}
+
+
+def read_sibling(tool):
+    out = _run(tool, ["ls", "--json"])
+    if out.returncode != 0:
+        raise Refused(4, "%s ls --json exited %d: %s"
+                         % (tool, out.returncode, out.stderr.strip()))
+    try:
+        body = json.loads(out.stdout)
+    except ValueError:
+        raise Refused(5, "%s ls --json did not return JSON" % tool)
+    if not isinstance(body, dict):
+        raise Refused(5, "%s ls --json returned %s, not an object"
+                      % (tool, type(body).__name__))
+    for name, kind in ENVELOPE[tool]:
+        if name not in body:
+            raise Refused(5, "%s ls --json carries no %s. This chartroom "
+                             "cannot read that envelope: upgrade "
+                             "chartroom." % (tool, name))
+        if not isinstance(body[name], kind):
+            raise Refused(5, "%s ls --json gave %s as %s, not %s"
+                          % (tool, name, type(body[name]).__name__,
+                             kind.__name__))
+    return body
+
+
+def read_sibling_checked(tool):
+    """--version, then the envelope. Never matches on message text -
+    the exit status of --version is the whole detection, per spec 3.4.
+    """
+    version = check_version(tool)
+    return version, read_sibling(tool)
+
+
+def _version_text(version):
+    return ".".join(str(n) for n in version)
+
+
+def _fetch_both():
+    """The versions come back with the bodies because the masthead
+    states which siblings produced the page. Reading them a second time
+    would be a second pair of subprocesses answering a question the
+    version check already asked."""
+    logbook_version, logbook_body = read_sibling_checked("logbook")
+    hail_version, hail_body = read_sibling_checked("hail")
+    versions = {"logbook": _version_text(logbook_version),
+                "hail": _version_text(hail_version)}
+    return versions, logbook_body, hail_body
+
+
+# ---------------------------------------------------------------------
+# The join
+# ---------------------------------------------------------------------
+
+# A session or entry with none of the four levels present. Named rather
+# than [], because both key functions must reach a bucket and an empty
+# list would drop the record from the page silently.
+UNKEYED = ("unkeyed", "", "")
+
+# A branch name that names no particular work. Two checkouts sitting on
+# main are not one work item, and "HEAD" is what a detached checkout
+# reports, so it collides across every repository at once.
+UNSCOPED_BRANCHES = frozenset(("HEAD", "main", "master", "develop",
+                               "trunk"))
+
+# logbook halves an oversized field and marks the cut. A truncated
+# repo_path names a directory that does not exist, so keying on it
+# mints a phantom row instead of joining the real one.
+TRUNCATED = "..."
+
+
+def _norm_path(path):
+    if not isinstance(path, str) or not path.strip():
+        return None
+    if path.endswith(TRUNCATED):
+        return None
+    return os.path.normpath(path.strip()) or None
+
+
+def repo_roots(entries):
+    """Every checkout root logbook named.
+
+    Only logbook knows a root, because only logbook asks git. hail
+    records the directory a session was launched from, which is as
+    often a subdirectory of one.
+    """
+    roots = set()
+    for entry in entries:
+        root = _norm_path(entry.get("repo_path"))
+        if root:
+            roots.add(root)
+    return roots
+
+
+def place_of(path, roots):
+    """The checkout a path belongs to, or the path itself.
+
+    The longest matching root wins, so a checkout nested inside another
+    keeps its own identity rather than dissolving into its parent.
+    """
+    clean = _norm_path(path)
+    if clean is None:
+        return None
+    best = None
+    for root in roots:
+        if clean == root or clean.startswith(root + os.sep):
+            if best is None or len(root) > len(best):
+                best = root
+    return best or clean
+
+
+def _scope(place):
+    """The scope half of a weak key.
+
+    A record with no knowable checkout scopes to "?" rather than to the
+    empty string, so it groups with its own kind instead of silently
+    joining every other placeless record.
+    """
+    return place if place else "?"
+
+
+def _ticket_keys(record):
+    """Branch-derived tickets only.
+
+    hail also records a ticket merely mentioned in a prompt, and a row
+    claiming "these sessions worked this" must not collect a session
+    that only talked about it.
+    """
+    if record.get("tickets_from_branch"):
+        return [("ticket", "", t) for t in record["tickets_from_branch"]
+                if t]
+    if record.get("ticket"):
+        return [("ticket", "", record["ticket"])]
+    return []
+
+
+def _pr_numbers(record):
+    numbers = []
+    if record.get("pr") is not None:
+        numbers.append(str(record["pr"]))
+    for pr in record.get("prs") or []:
+        if pr.get("number") is not None:
+            numbers.append(str(pr["number"]))
+    return numbers
+
+
+def _branch_names(record):
+    names = []
+    if record.get("branch"):
+        names.append(record["branch"])
+    names.extend(b for b in record.get("branches") or [] if b)
+    return [b for b in names if b not in UNSCOPED_BRANCHES]
+
+
+def weak_values(record):
+    for number in _pr_numbers(record):
+        yield ("pr", number)
+    for name in _branch_names(record):
+        yield ("branch", name)
+
+
+def ambiguous_values(records, roots):
+    """Weak values that name different work in different checkouts.
+
+    A PR number is unique only inside its repository and a branch name
+    only inside its checkout, so in principle both want scoping. In
+    practice scoping every one of them splits a work item whenever a
+    record cannot name its checkout, which is every obligation written
+    outside a repository and every session hail saw no cwd for. So
+    scope only what is actually ambiguous here: a value that turns up
+    under two different checkouts in this very dataset.
+    """
+    places = {}
+    for record in records:
+        place = place_of(record.get("repo_path") or record.get("cwd"),
+                         roots)
+        if place is None:
+            continue
+        for value in weak_values(record):
+            places.setdefault(value, set()).add(place)
+    return set(value for value, seen in places.items() if len(seen) > 1)
+
+
+def named_prs(entries):
+    """Every PR number an obligation carries.
+
+    The ledger is the only side that says what a PR means to this
+    person: a session's PR comes from the harness, which stamps one on
+    its own and gets it wrong. One session here carried 720 records
+    claiming a PR merged months earlier on somebody else's branch.
+    """
+    return frozenset(str(e["pr"]) for e in entries
+                     if e.get("pr") is not None)
+
+
+def _pr_keys(record, place, ambiguous, named=None):
+    """PR keys, minus the ones no obligation ever names.
+
+    A PR nothing is owed against is not evidence of what a session
+    worked on, and at full rank one false claim outranks the branch and
+    carries the session off its own work item - the obligations left
+    with no session, the PR with no obligations. `named` is None where
+    there is no ledger to ask, which keeps every PR.
+    """
+    numbers = _pr_numbers(record)
+    if named is not None:
+        numbers = [n for n in numbers if n in named]
+    return [("pr", _scope(place) if ("pr", n) in ambiguous else "", n)
+            for n in numbers]
+
+
+def _branch_keys(record, place, ambiguous):
+    return [("branch",
+             _scope(place) if ("branch", b) in ambiguous else "", b)
+            for b in _branch_names(record)]
+
+
+def _dir_keys(place):
+    return [("dir", "", place)] if place else []
+
+
+def all_keys(record, roots, ambiguous=frozenset(), named=None):
+    """Every level a record answers at, strongest first.
+
+    Collected rather than stopping at the first: the levels a record
+    can answer at are what witness an alias, and a record answering at
+    two levels is the only evidence that those two levels name one
+    piece of work.
+    """
+    place = place_of(record.get("repo_path") or record.get("cwd"), roots)
+    return (_ticket_keys(record) + _pr_keys(record, place, ambiguous, named)
+            + _branch_keys(record, place, ambiguous) + _dir_keys(place))
+
+
+def build_alias(records, roots, ambiguous=frozenset(), named=None):
+    """Weak keys bound to the ticket a record witnessed them beside.
+
+    One hop, never a closure: a transitive merge would let one session
+    that glanced at a second ticket weld two work items together for
+    good, and every later session on either would widen the weld. A
+    weak key seen beside two different tickets binds to neither, on the
+    grounds that a guess here silently merges unrelated work.
+
+    Only a PR or a branch can bind. A directory is a place, not a piece
+    of work: many tickets share one checkout, so binding it would sweep
+    every unticketed obligation in that checkout into whichever ticket
+    a session there happened to name.
+    """
+    seen = {}
+    for record in records:
+        keys = all_keys(record, roots, ambiguous, named)
+        tickets = [k for k in keys if k[0] == "ticket"]
+        if len(tickets) != 1:
+            continue
+        for key in keys:
+            if key[0] not in ("pr", "branch"):
+                continue
+            seen.setdefault(key, set()).add(tickets[0])
+    return {key: next(iter(strong)) for key, strong in seen.items()
+            if len(strong) == 1}
+
+
+def rows_for(record, roots, alias=None, ambiguous=frozenset(), named=None):
+    """Every row a record belongs on.
+
+    The strongest level it answers at, and all of that level's keys: a
+    branch naming two tickets worked both. Weaker keys resolve through
+    the alias first, so an obligation carrying only a PR still meets
+    the sessions that knew its ticket.
+    """
+    keys = all_keys(record, roots, ambiguous, named)
+    if not keys:
+        return [UNKEYED]
+    top = keys[0][0]
+    same = [key for key in keys if key[0] == top]
+    if top == "ticket" or not alias:
+        return same
+    return list(dict.fromkeys(alias.get(key, key) for key in same))
+
+
+def _row_label(key, repo_for_pr):
+    via, _place, raw = key
+    if via == "pr":
+        return "%s#%s" % (repo_for_pr, raw) if repo_for_pr else "#%s" % raw
+    if via == "unkeyed":
+        return "unkeyed"
+    return raw
+
+
+def _sort_value(row, by):
+    if by == "key":
+        return row["key"]
+    if by == "open":
+        return len(row["obligations"])
+    if by == "sessions":
+        return len(row["sessions"])
+    if by == "age":
+        stamps = [s.get("last_ts") for s in row["sessions"]
+                 if s.get("last_ts")]
+        # a row with no session timestamp has no age evidence; it sorts
+        # as though nothing has ever happened, i.e. oldest
+        return max(stamps) if stamps else ""
+    return row["key"]
+
+
+def aside_kinds(logbook_body):
+    """The kinds logbook says do not block, by name.
+
+    Only an explicit False sets a kind aside. A kind logbook does not
+    declare, or declares in a shape this cannot read, stays in front of
+    the reader: the page's whole claim is what is outstanding, so the
+    safe side of not knowing is to show it.
+    """
+    if not CFG["rows"]["blocking_only"]:
+        return frozenset()
+    declared = logbook_body.get("kinds") or {}
+    return frozenset(
+        name for name, spec in declared.items()
+        if isinstance(spec, dict) and spec.get("blocking") is False)
+
+
+def split_obligations(entries, aside):
+    """What blocks, and what is only on record.
+
+    A decision is not work. It was true when it was written and nothing
+    arrives to close it, so it accumulates: on the ledger this was built
+    against, seven of every ten open entries were decisions and they
+    buried the thirty that somebody had to act on.
+    """
+    front, rest = [], []
+    for entry in entries:
+        (rest if entry.get("kind") in aside else front).append(entry)
+    return front, rest
+
+
+def build_items(logbook_body, hail_body, built_at=None):
+    """Both sides joined into work items, one per distinct key.
+
+    rows_for always returns at least one key (UNKEYED rather than []),
+    so every entry and every session lands somewhere.
+    """
+    entries = logbook_body.get("entries") or []
+    sessions = hail_body.get("sessions") or []
+    all_session_ids = set(s.get("id") for s in sessions if s.get("id"))
+
+    roots = repo_roots(entries)
+    records = list(entries) + list(sessions)
+    ambiguous = ambiguous_values(records, roots)
+    named = named_prs(entries)
+    alias = build_alias(records, roots, ambiguous, named)
+
+    rows = {}
+
+    def row_for(key):
+        if key not in rows:
+            rows[key] = {"key": key[2], "via": key[0],
+                        "obligations": [], "sessions": [],
+                        "repo_for_pr": None}
+        return rows[key]
+
+    for entry in entries:
+        for key in rows_for(entry, roots, alias, ambiguous, named):
+            row_for(key)["obligations"].append(entry)
+
+    for rec in sessions:
+        for key in rows_for(rec, roots, alias, ambiguous, named):
+            row = row_for(key)
+            row["sessions"].append(rec)
+            if key[0] == "pr":
+                for pr in rec.get("prs") or []:
+                    if (pr.get("number") is not None
+                            and str(pr["number"]) == key[2]
+                            and pr.get("repo")):
+                        row["repo_for_pr"] = pr["repo"]
+
+    aside = aside_kinds(logbook_body)
+
+    items = []
+    for key, row in rows.items():
+        aged_out = sum(
+            1 for e in row["obligations"]
+            if e.get("session") and e["session"] not in all_session_ids)
+        row["obligations"].sort(key=lambda e: e.get("ts") or "")
+        front, rest = split_obligations(row["obligations"], aside)
+        items.append({
+            "key": row["key"], "via": row["via"],
+            "label": _row_label((row["via"], "", row["key"]),
+                                row["repo_for_pr"]),
+            "obligations": front,
+            "aside": rest,
+            "sessions": row["sessions"],
+            "aged_out": aged_out,
+        })
+
+    by = CFG["sort"]["by"]
+    direction = CFG["sort"]["dir"]
+    items.sort(key=lambda r: _sort_value(r, by), reverse=(direction == "desc"))
+    return items
+
+
+def only_open_rows(items):
+    """Drop the rows that owe nothing, and say how many that was.
+
+    The page answers "what do I owe". A row with sessions and no open
+    obligation answers a different question, and on a real ledger they
+    are most of the table, so the rows that matter are read past rather
+    than read. The count travels back so the masthead can state it: a
+    row removed without a word is a page lying by omission.
+    """
+    if not CFG["rows"]["only_open"]:
+        return list(items), 0
+    kept = [i for i in items if i["obligations"]]
+    return kept, len(items) - len(kept)
+
+
+def aside_items(items):
+    """Every work item that has something on record, carrying only
+    that.
+
+    Built from the full list, before only_open_rows has run. An item
+    whose obligations are all decisions leaves the page entirely, and
+    those decisions are exactly what somebody reopening the ticket in a
+    month goes looking for - dropping them with the row would be the
+    page destroying the record it exists to keep.
+    """
+    return [dict(item, obligations=item["aside"], aside=[])
+            for item in items if item["aside"]]
+
+
+def session_list(hail_body):
+    """The sessions for the pane, most recent first, and how many were
+    left off.
+
+    Not the sessions on the kept rows. "Where was I working" is a
+    different question from "what do I owe", and this pane is the one
+    that answers it, including for work that owes nothing.
+
+    Capped, because a wide hail window puts hundreds here and a pane
+    nobody can reach the bottom of is the crowding this page exists to
+    undo. The count travels back so the masthead can state it.
+    """
+    seen = {}
+    for rec in hail_body.get("sessions") or []:
+        sid = rec.get("id")
+        if sid and sid not in seen:
+            seen[sid] = rec
+    ordered = sorted(
+        seen.values(),
+        key=lambda r: (r.get("last_ts") or "", r.get("id") or ""),
+        reverse=True)
+    limit = CFG["sessions"]["limit"]
+    if limit <= 0 or len(ordered) <= limit:
+        return ordered, 0
+    return ordered[:limit], len(ordered) - limit
+
+
+def page_meta(logbook_body, hail_body, built_at=None, versions=None):
+    thresholds = logbook_body.get("thresholds") or {}
+    census = hail_body.get("census") or {}
+    return {
+        "built_at": built_at or _now_iso(),
+        "days": hail_body.get("days"),
+        "stale_days": thresholds.get("stale_days"),
+        "aged_off": census.get("aged_off") or 0,
+        "versions": versions or {},
+    }
+
+
+def _census(items):
+    """The masthead's numbers, all derived from the rows themselves.
+
+    Sessions count by id rather than by row: a session keyed under two
+    branch tickets sits on two rows and is still one session.
+    """
+    ids = set()
+    by_via = {}
+    for item in items:
+        by_via[item["via"]] = by_via.get(item["via"], 0) + 1
+        for sess in item["sessions"]:
+            if sess.get("id"):
+                ids.add(sess["id"])
+    return {
+        "work_items": len(items),
+        "by_via": by_via,
+        "open": sum(len(i["obligations"]) for i in items),
+        "sessions": len(ids),
+    }
+
+
+def _now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _local_stamp(ts):
+    """A UTC stamp as the reader's own wall clock, for the masthead.
+
+    Display only. built_at stays UTC in the embedded data, because the
+    browser ages every row against it and a localised value would put
+    every age out by the offset.
+
+    Unparseable input is returned as given: a masthead with no build
+    time at all is worse than one showing a stamp nobody can read.
+    """
+    if not isinstance(ts, str):
+        return ts
+    parsed = _parse_stamp(ts)
+    if parsed is None:
+        return ts
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+# ---------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------
+
+# Per session, the section 8 allowlist and nothing else. prompts and
+# last_prompt are the highest-sensitivity fields hail holds; path is the
+# transcript on disk; project is a mangling of cwd; a PR's url is
+# reconstructible and not needed to render a label.
+SESSION_ALLOW = ("id", "title", "cwd", "turns", "first_ts", "last_ts",
+                 "branches", "tickets_from_branch", "prs")
+
+# Per obligation, the fields the page actually shows. Everything else
+# logbook writes (status, repo, why, ...) is redundant with the row it
+# is already filed under.
+OBLIGATION_ALLOW = ("id", "kind", "ts", "text", "session")
+
+
+def _obligation_view(entry):
+    return dict((k, entry.get(k)) for k in OBLIGATION_ALLOW)
+
+
+def _session_view(rec):
+    view = {}
+    for key in SESSION_ALLOW:
+        if key == "prs":
+            view["prs"] = [{"number": p.get("number"), "repo": p.get("repo")}
+                           for p in rec.get("prs") or []]
+        elif key in ("branches", "tickets_from_branch"):
+            view[key] = rec.get(key) or []
+        else:
+            view[key] = rec.get(key)
+    return view
+
+
+def _item_view(item):
+    return {
+        "key": item["key"], "via": item["via"], "label": item["label"],
+        "obligations": [_obligation_view(e) for e in item["obligations"]],
+        "sessions": [_session_view(s) for s in item["sessions"]],
+        "aged_out": item.get("aged_out", 0),
+    }
+
+
+def _embed(payload):
+    """JSON for a <script> block.
+
+    `</script>` inside a string ends the block wherever it appears, so
+    the escape is on `<` and not on the tag: a branch name is a
+    user-controlled string and this is the only thing between it and
+    execution.
+    """
+    return json.dumps(payload, sort_keys=True).replace("<", "\\u003c")
+
+
+def _esc(value):
+    return html.escape(str(value if value is not None else ""), quote=True)
+
+
+def _drop_fraction(text):
+    """The same timestamp without its fractional seconds, offset kept.
+
+    Python 3.9's fromisoformat accepts a 3- or 6-digit fraction and
+    nothing else, and neither sibling promises a digit count.
+    """
+    head, sep, tail = text.partition(".")
+    if not sep:
+        return None
+    for i, char in enumerate(tail):
+        if char in "+-":
+            return head + tail[i:]
+    return head
+
+
+def _parse_stamp(ts):
+    """A timestamp as a datetime, in UTC where it said so, or None.
+
+    Both shapes arrive and both must parse. hail writes a trailing "Z";
+    logbook writes a local offset, which is every timestamp in a real
+    ledger. A parser that handles only one of them makes staleness
+    unreachable rather than wrong, which is the kind of failure that
+    reads as "nothing is stale yet".
+
+    Python 3.9's fromisoformat is the constraint: it parses the offset
+    but not the "Z", so the "Z" is rewritten into an offset first.
+    """
+    if not isinstance(ts, str):
+        return None
+    text = ts.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = None
+    for candidate in (text, _drop_fraction(text)):
+        if candidate is None:
+            continue
+        try:
+            parsed = datetime.datetime.fromisoformat(candidate)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(datetime.timezone.utc)
+    return parsed
+
+
+def _parse_date(ts):
+    """The calendar date a timestamp falls on, in UTC, or None."""
+    parsed = _parse_stamp(ts)
+    return None if parsed is None else parsed.date()
+
+
+def _severity_note(item, stale_days, today):
+    """A plain-text hint next to the row: blocked, aging, open or
+    nothing.
+
+    Aged against the build's own timestamp, not the clock: the page is
+    a build artifact, and a row that quietly turns amber while the file
+    sits unopened is describing a build that never happened.
+    """
+    kinds = set(e.get("kind") for e in item["obligations"])
+    if "blocked" in kinds:
+        return "blocked"
+    if stale_days is not None and today is not None:
+        for e in item["obligations"]:
+            day = _parse_date(e.get("ts"))
+            if day is None:
+                continue
+            if (today - day).days > stale_days:
+                return "aging"
+    if item["obligations"]:
+        return "open"
+    return ""
+
+
+_STYLE = """
+<style>
+:root{--fg:#1a1a1a;--bg:#fbfbfa;--panel:#fff;--line:#e0ded9;
+  --dim:#6b6862;--faint:#8d8a84;--via:#efedea;
+  --blocked:#b3261e;--aging:#9a6400;--open:#4f6d8c;
+  --parked:#7a5ea8;--unverified:#9a6400;--followup:#3f7a5e;
+  --deploy:#2f6f8f;--decision:#8d8a84}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){--fg:#eceae6;--bg:#17181a;
+    --panel:#1e2022;--line:#32353a;--dim:#a0a09c;--faint:#7e807f;
+    --via:#2a2d30;--blocked:#ff8a80;--aging:#e3a008;--open:#8ab4d8;
+    --parked:#c2a8f0;--unverified:#e3a008;--followup:#6fd0a3;
+    --deploy:#7fc4e8;--decision:#7e807f}
+}
+:root[data-theme="dark"]{--fg:#eceae6;--bg:#17181a;--panel:#1e2022;
+  --line:#32353a;--dim:#a0a09c;--faint:#7e807f;--via:#2a2d30;
+  --blocked:#ff8a80;--aging:#e3a008;--open:#8ab4d8;--parked:#c2a8f0;
+  --unverified:#e3a008;--followup:#6fd0a3;--deploy:#7fc4e8;
+  --decision:#7e807f}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.45 -apple-system,system-ui,sans-serif}
+header{padding:16px 16px 0}
+h1{font-size:18px;margin:0 0 4px}
+.meta{color:var(--dim);font-size:12px;margin-bottom:4px}
+.controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;
+  padding:0 16px;margin:12px 0 4px}
+.controls input,.controls select,.controls button{font:inherit;
+  padding:3px 6px;background:var(--bg);color:var(--fg);
+  border:1px solid var(--line);border-radius:4px}
+.controls input{min-width:0;flex:1 1 12em}
+.controls button{cursor:pointer}
+.controls label,#shown{color:var(--dim);font-size:12px}
+.chips{margin:0 0 4px;gap:6px}
+.chip{font:inherit;font-size:12px;padding:2px 8px;cursor:pointer;
+  background:var(--bg);color:var(--dim);border:1px solid var(--line);
+  border-radius:999px}
+.chip .n{color:var(--faint);margin-left:2px}
+.chip[data-on="1"]{background:var(--fg);color:var(--bg);
+  border-color:var(--fg)}
+.chip[data-on="1"] .n{color:var(--bg);opacity:.65}
+main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+  gap:clamp(12px,2vw,22px);
+  padding:clamp(12px,2vw,18px) 16px 60px;align-items:start}
+@media (max-width:1000px){main{grid-template-columns:minmax(0,1fr)}}
+section>h2{margin:0 0 10px;font-size:11px;font-weight:650;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--faint);
+  display:flex;align-items:center;gap:8px}
+section>h2::after{content:"";flex:1;height:1px;background:var(--line)}
+.item{margin:0 0 18px}
+.item>h3{margin:0 0 6px;font-size:13px;font-weight:650;
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.via{display:inline-block;font-size:10px;color:var(--dim);
+  background:var(--via);border-radius:3px;padding:1px 5px;
+  font-weight:400}
+.sev{font-size:11px;font-weight:600;text-transform:uppercase;
+  letter-spacing:.05em}
+.sev-blocked{color:var(--blocked)}
+.sev-aging{color:var(--aging)}
+.sev-open{color:var(--open)}
+.card{background:var(--panel);border:1px solid var(--line);
+  border-left:3px solid var(--line);border-radius:8px;
+  padding:8px 10px;margin-bottom:7px}
+.card.k-parked{border-left-color:var(--parked)}
+.card.k-blocked{border-left-color:var(--blocked)}
+.card.k-unverified{border-left-color:var(--unverified)}
+.card.k-followup{border-left-color:var(--followup)}
+.card.k-deploy{border-left-color:var(--deploy)}
+.card.k-decision{border-left-color:var(--decision)}
+.chead{display:flex;align-items:baseline;gap:7px;font-size:11px;
+  color:var(--faint)}
+.chead b{font-size:11px;font-weight:650;text-transform:uppercase;
+  letter-spacing:.05em;color:var(--dim)}
+.chead .age{margin-left:auto;font-variant-numeric:tabular-nums}
+.card pre{margin:4px 0 0;white-space:pre-wrap;word-break:break-word;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:12px}
+.on{margin-top:5px;font-size:11.5px;color:var(--faint);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sess{background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;margin-bottom:7px}
+.sess .stitle{font-weight:600;display:block;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sess .srow{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap;
+  font-size:11.5px;color:var(--faint);margin-top:3px}
+.sess .srow .age{margin-left:auto;font-variant-numeric:tabular-nums}
+.sess code{display:block;margin-top:5px;font-size:11.5px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  color:var(--dim);overflow-x:auto;white-space:pre}
+button.copy{font:inherit;font-size:11px;padding:1px 7px;margin-top:5px;
+  cursor:pointer;background:var(--bg);color:var(--fg);
+  border:1px solid var(--line);border-radius:4px}
+details{margin-top:22px;border-top:1px solid var(--line);
+  padding-top:10px}
+summary{cursor:pointer;font-size:11px;font-weight:650;
+  text-transform:uppercase;letter-spacing:.1em;color:var(--faint)}
+details .item{margin-top:14px}
+#empty,#nosess,.none{color:var(--dim);margin:8px 2px;font-size:12.5px}
+[hidden]{display:none!important}
+</style>
+"""
+
+# Wiring lives in one script block rather than on each element: a page
+# with hundreds of cards repeats an inline handler hundreds of times,
+# and an inline handler is the one thing the page's own
+# Content-Security-Policy would have to be loosened for.
+_SCRIPT = """
+<script>
+const items = Array.from(document.querySelectorAll("#items > .item"));
+const board = document.getElementById("items");
+const cards = Array.from(document.querySelectorAll(".sess"));
+const built = Date.parse(CHARTROOM_DATA.built_at);
+
+for (const button of document.querySelectorAll("button.copy")) {
+  button.addEventListener("click", function () {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(
+        this.previousElementSibling.textContent);
+    }
+  });
+}
+
+// Ages are relative to built_at, never to the reader's clock: the page
+// is a build artifact and a page opened next week must still describe
+// the build, not silently re-date itself.
+for (const cell of document.querySelectorAll(".age")) {
+  const ts = Date.parse(cell.getAttribute("data-ts"));
+  if (isNaN(ts) || isNaN(built)) { continue; }
+  const days = Math.floor((built - ts) / 86400000);
+  cell.textContent = days <= 0 ? "today" : days + "d";
+}
+
+// One haystack per item and per session, built from the embedded
+// record rather than the rendered markup, so the filter reaches a
+// field the card chose not to print.
+const hay = CHARTROOM_DATA.items.map(function (item) {
+  return JSON.stringify(item).toLowerCase();
+});
+const shay = CHARTROOM_DATA.sessions.map(function (s) {
+  return JSON.stringify(s).toLowerCase();
+});
+
+function sortValue(index, by) {
+  const item = CHARTROOM_DATA.items[index];
+  if (by === "key") { return item.key; }
+  if (by === "open") { return item.obligations.length; }
+  if (by === "sessions") { return item.sessions.length; }
+  const stamps = item.sessions.map(function (s) { return s.last_ts; })
+    .filter(Boolean).sort();
+  return stamps.length ? stamps[stamps.length - 1] : "";
+}
+
+const query = document.getElementById("q");
+const by = document.getElementById("by");
+const dir = document.getElementById("dir");
+const shown = document.getElementById("shown");
+const empty = document.getElementById("empty");
+const chips = Array.from(document.querySelectorAll("button.chip"));
+const nosess = document.getElementById("nosess");
+const aside = document.getElementById("aside");
+const asideSummary = aside ? aside.querySelector("summary") : null;
+const asideLabel = asideSummary ? asideSummary.textContent : "";
+
+// Nothing selected means no kind filter at all, which is why the page
+// opens whole rather than opening with every chip lit and daring you
+// to work out which one to turn off.
+function chosen() {
+  const on = chips.filter(function (c) {
+    return c.getAttribute("data-on") === "1";
+  });
+  return on.length ? on.map(function (c) {
+    return c.getAttribute("data-chip");
+  }) : null;
+}
+
+// Hides the cards of other kinds and answers whether any survived, so
+// a work item holding a deploy and a followup can show the deploy
+// alone instead of the item being all-or-nothing.
+function keepCards(element, kinds) {
+  let kept = 0;
+  for (const card of element.querySelectorAll(".card")) {
+    const match = !kinds || kinds.indexOf(card.getAttribute("data-kind")) !== -1;
+    card.hidden = !match;
+    if (match) { kept += 1; }
+  }
+  return kept;
+}
+
+function apply() {
+  const kinds = chosen();
+  const needle = query.value.trim().toLowerCase();
+  const key = by.value;
+  const ascending = dir.getAttribute("data-dir") === "asc";
+  const order = items.map(function (_, i) { return i; });
+  order.sort(function (a, b) {
+    const x = sortValue(a, key), y = sortValue(b, key);
+    // the original index breaks ties, so a re-sort never reshuffles
+    // items that compare equal
+    if (x < y) { return ascending ? -1 : 1; }
+    if (x > y) { return ascending ? 1 : -1; }
+    return a - b;
+  });
+  let visible = 0;
+  const live = {};
+  for (const i of order) {
+    const kept = keepCards(items[i], kinds);
+    const match = (!needle || hay[i].indexOf(needle) !== -1) && kept > 0;
+    items[i].hidden = !match;
+    if (match) {
+      visible += 1;
+      for (const e of CHARTROOM_DATA.items[i].obligations) {
+        if (e.session) { live[e.session] = true; }
+      }
+    }
+    board.appendChild(items[i]);
+  }
+  // the right pane follows the same filter: a search that leaves the
+  // sessions untouched is a page half-answering the question. Under a
+  // kind filter it narrows to the sessions those obligations name,
+  // which is the question "who left these" answered without a click.
+  let listed = 0;
+  cards.forEach(function (card, i) {
+    const text = needle ? shay[i].indexOf(needle) !== -1 : true;
+    const kind = !kinds || live[CHARTROOM_DATA.sessions[i].id] === true;
+    card.hidden = !(text && kind);
+    if (!card.hidden) { listed += 1; }
+  });
+  // the session that left a deploy six weeks ago is past
+  // sessions.limit, so a kind filter empties this pane often. An empty
+  // column with no words in it reads as a bug.
+  if (nosess) {
+    nosess.hidden = !(kinds && cards.length > 0 && listed === 0);
+  }
+  if (aside) {
+    const kept = keepCards(aside, kinds);
+    aside.hidden = kept === 0;
+    if (asideSummary) {
+      asideSummary.textContent = kinds
+        ? kept + " on record" : asideLabel;
+    }
+    // picking a kind that only lives in here would otherwise look like
+    // an empty page: the matches are behind a closed control
+    if (kinds && kept > 0 && visible === 0) { aside.open = true; }
+  }
+  shown.textContent = visible + " of " + items.length + " shown";
+  empty.hidden = visible !== 0 || (aside && !aside.hidden);
+}
+
+for (const chip of chips) {
+  chip.addEventListener("click", function () {
+    const on = this.getAttribute("data-on") === "1";
+    if (on) { this.removeAttribute("data-on"); }
+    else { this.setAttribute("data-on", "1"); }
+    apply();
+  });
+}
+
+query.addEventListener("input", apply);
+by.addEventListener("change", apply);
+dir.addEventListener("click", function () {
+  const ascending = this.getAttribute("data-dir") === "asc";
+  this.setAttribute("data-dir", ascending ? "desc" : "asc");
+  this.textContent = ascending ? "descending" : "ascending";
+  apply();
+});
+apply();
+</script>
+"""
+
+
+def _masthead(items, meta):
+    census = _census(items)
+    versions = meta.get("versions") or {}
+    line = ["built %s" % _esc(_local_stamp(meta.get("built_at"))),
+            "chartroom %s" % _esc(VERSION)]
+    for tool in ("logbook", "hail"):
+        if versions.get(tool):
+            line.append("%s %s" % (tool, _esc(versions[tool])))
+
+    counts = ["%d work item(s)" % census["work_items"]]
+    levels = ", ".join("%d %s" % (census["by_via"][v], _esc(v))
+                       for v in sorted(census["by_via"]))
+    if levels:
+        counts.append(levels)
+    counts.append("%d open" % census["open"])
+    counts.append("%d session(s)" % meta.get("session_count", 0))
+    # only where non-zero: a permanent "0 aged off" is a number nobody
+    # ever reads, and it hides the one case worth noticing
+    if meta.get("aged_off"):
+        counts.append("%d aged off" % meta["aged_off"])
+    if meta.get("on_record"):
+        counts.append("%d on record" % meta["on_record"])
+    if meta.get("sessions_dropped"):
+        counts.append("%d older session(s) not listed"
+                      % meta["sessions_dropped"])
+    if meta.get("hidden"):
+        counts.append("%d with nothing open hidden" % meta["hidden"])
+
+    return ("<header><h1>chartroom</h1>"
+            "<div class=\"meta\">%s</div>"
+            "<div class=\"meta\">%s</div></header>"
+            % (" &middot; ".join(line), " &middot; ".join(counts)))
+
+
+def _kind_chips(items, aside):
+    """One toggle per kind on this page, with how many there are.
+
+    Built from what was rendered, not from logbook's vocabulary: a chip
+    for a kind with nothing behind it is a control whose only possible
+    result is an empty page. Nothing starts selected, so the page opens
+    whole and the chips are something you reach for, not something you
+    have to clear.
+
+    The search box nearly does this and is a trap. Its haystack is the
+    whole record, so `deploy` also matches an obligation whose text
+    mentions deploying, and it hides whole work items rather than the
+    cards inside them.
+    """
+    counts = {}
+    for item in list(items) + list(aside or []):
+        for entry in item["obligations"]:
+            kind = entry.get("kind")
+            if kind:
+                counts[kind] = counts.get(kind, 0) + 1
+    if len(counts) < 2:
+        return ""
+    chips = "".join(
+        "<button type=\"button\" class=\"chip\" data-chip=\"%s\">"
+        "%s <span class=\"n\">%d</span></button>"
+        % (_esc(kind), _esc(kind), counts[kind])
+        for kind in sorted(counts))
+    return "<div class=\"controls chips\" id=\"kinds\">%s</div>" % chips
+
+
+def _controls():
+    """The filter box and the sort controls.
+
+    The select opens on sort.by and the button on sort.dir, so the
+    controls describe the order the items are already in rather than
+    claiming an order the page does not have.
+    """
+    options = []
+    for key in SORT_KEYS:
+        selected = " selected" if key == CFG["sort"]["by"] else ""
+        options.append("<option value=\"%s\"%s>%s</option>"
+                       % (_esc(key), selected, _esc(key)))
+    ascending = CFG["sort"]["dir"] != "desc"
+    return ("<div class=\"controls\">"
+            "<input id=\"q\" type=\"search\" placeholder=\"filter\" "
+            "autocomplete=\"off\">"
+            "<label for=\"by\">sort</label>"
+            "<select id=\"by\">%s</select>"
+            "<button type=\"button\" id=\"dir\" data-dir=\"%s\">%s</button>"
+            "<span id=\"shown\"></span></div>"
+            % ("".join(options),
+               "asc" if ascending else "desc",
+               "ascending" if ascending else "descending"))
+
+
+def _age_span(ts, cls="age"):
+    """A stamp the page turns into an age against built_at."""
+    return ("<span class=\"%s\" data-ts=\"%s\">%s</span>"
+            % (cls, _esc(ts or ""), _esc((ts or "")[:10] or "-")))
+
+
+def _obligation_card(entry, titles):
+    """One obligation, text and all.
+
+    The text is the thing. It used to sit behind a click, which made
+    the page something you operated rather than something you read.
+    """
+    where = ""
+    title = titles.get(entry.get("session"))
+    if title:
+        where = "<div class=\"on\">in %s</div>" % _esc(title)
+    return ("<div class=\"card k-%s\" data-kind=\"%s\">"
+            "<div class=\"chead\"><b>%s</b>%s</div>"
+            "<pre>%s</pre>%s</div>"
+            % (_esc(entry.get("kind")), _esc(entry.get("kind")),
+               _esc(entry.get("kind")),
+               _age_span(entry.get("ts")), _esc(entry.get("text")), where))
+
+
+def _item_block(item, titles, severity=""):
+    sev = ("<span class=\"sev sev-%s\">%s</span>"
+           % (_esc(severity), _esc(severity))) if severity else ""
+    aged = ("<span class=\"via\">%d aged off</span>" % item["aged_out"]
+            ) if item.get("aged_out") else ""
+    cards = "".join(_obligation_card(e, titles)
+                    for e in item["obligations"])
+    return ("<article class=\"item\"><h3>%s"
+            "<span class=\"via\">%s</span>%s%s</h3>%s</article>"
+            % (_esc(item["label"]), _esc(item["via"]), sev, aged, cards))
+
+
+def _session_card(sess):
+    cwd = sess.get("cwd") or ""
+    sid = sess.get("id") or ""
+    tags = []
+    for ticket in sess.get("tickets_from_branch") or []:
+        tags.append("<span class=\"via\">%s</span>" % _esc(ticket))
+    for branch in (sess.get("branches") or [])[:1]:
+        tags.append("<span class=\"via\">%s</span>" % _esc(branch))
+    for pr in sess.get("prs") or []:
+        if pr.get("number") is not None:
+            tags.append("<span class=\"via\">#%s</span>"
+                        % _esc(pr["number"]))
+    turns = sess.get("turns")
+    if turns is not None:
+        tags.append("%s turns" % _esc(turns))
+    return ("<div class=\"sess\"><span class=\"stitle\">%s</span>"
+            "<div class=\"srow\">%s%s</div>"
+            "<code>cd %s &amp;&amp; claude -r %s</code>"
+            "<button type=\"button\" class=\"copy\">copy</button></div>"
+            % (_esc(sess.get("title") or "(untitled)"),
+               "".join(tags), _age_span(sess.get("last_ts")),
+               _esc(shlex.quote(cwd)), _esc(sid)))
+
+
+def render(items, meta, aside=None, sessions=None, dropped=0):
+    """One self-contained HTML string. No network resource, no CDN.
+
+    Two panes: what is owed on the left, where it was worked on the
+    right. The only thing that varies between two builds of the same
+    input is meta["built_at"] - every dict below is written in a fixed
+    key order and every list is in the order build_items already fixed,
+    so the output is diffable.
+    """
+    aside = list(aside or [])
+    sessions = list(sessions if sessions is not None
+                    else _sessions_of(items))
+    titles = dict((s.get("id"), s.get("title")) for s in sessions
+                  if s.get("id"))
+
+    payload = {
+        "built_at": meta.get("built_at"),
+        "days": meta.get("days"),
+        "stale_days": meta.get("stale_days"),
+        "aged_off": meta.get("aged_off"),
+        "items": [_item_view(i) for i in items],
+        "sessions": [_session_view(s) for s in sessions],
+    }
+    embedded = _embed(payload)
+
+    stale_days = meta.get("stale_days")
+    today = _parse_date(meta.get("built_at"))
+    blocks = "".join(
+        _item_block(item, titles, _severity_note(item, stale_days, today))
+        for item in items)
+
+    on_record = sum(len(i["obligations"]) for i in aside)
+    disclosure = ""
+    if aside:
+        # no empty details element: a control that opens on nothing is
+        # a control that should not be there
+        disclosure = (
+            "<details id=\"aside\"><summary>%d %s on record</summary>%s"
+            "</details>"
+            % (on_record, "decision" if on_record == 1 else "decisions",
+               "".join(_item_block(i, titles) for i in aside)))
+
+    head = dict(meta)
+    head["on_record"] = on_record
+    head["session_count"] = len(sessions)
+    head["sessions_dropped"] = dropped
+
+    session_html = "".join(_session_card(s) for s in sessions)
+    if not session_html:
+        session_html = ("<p class=\"none\">no sessions in hail\u2019s "
+                        "window</p>")
+
+    return "".join([
+        # A doctype keeps the browser out of quirks mode, and the
+        # charset must be declared rather than sniffed: the page holds
+        # whatever the ledger recorded. The policy makes "loads no
+        # network resource" something the browser enforces rather than
+        # something this file promises; the style and script are the
+        # page's own, so allowing them inline costs nothing.
+        "<!doctype html>",
+        "<html lang=\"en\"><head><meta charset=\"utf-8\">",
+        "<meta name=\"viewport\" content=\"width=device-width,"
+        "initial-scale=1\">",
+        "<meta http-equiv=\"Content-Security-Policy\" content=\""
+        "default-src 'none'; style-src 'unsafe-inline'; "
+        "script-src 'unsafe-inline'; form-action 'none'; "
+        "base-uri 'none'\">",
+        "<title>chartroom</title>",
+        _STYLE,
+        "</head><body>",
+        _masthead(items, head),
+        _controls(),
+        _kind_chips(items, aside),
+        "<main><section><h2>obligations &mdash; logbook</h2>"
+        "<div id=\"items\">%s</div>"
+        "<p id=\"empty\" hidden>no work items match that filter</p>"
+        "%s</section>"
+        "<section><h2>sessions &mdash; hail</h2>"
+        "<div id=\"sessions\">%s</div>"
+        "<p id=\"nosess\" hidden>no listed session left any of these. "
+        "The ones that did are older than this pane shows.</p>"
+        "</section></main>"
+        % (blocks, disclosure, session_html),
+        "<script>const CHARTROOM_DATA = ", embedded, ";</script>",
+        _SCRIPT,
+        "</body></html>",
+    ])
+
+
+def _sessions_of(items):
+    """The sessions on these items, deduplicated, most recent first.
+
+    Only a fallback for a caller that renders without hail's own list.
+    """
+    seen = {}
+    for item in items:
+        for rec in item["sessions"]:
+            if rec.get("id") and rec["id"] not in seen:
+                seen[rec["id"]] = rec
+    return sorted(seen.values(),
+                  key=lambda r: (r.get("last_ts") or "", r.get("id") or ""),
+                  reverse=True)
+
+
+def page_target():
+    """Where the page goes, refusing what cannot be written.
+
+    Every refusal here is a configuration mistake with an obvious
+    correction, so it is worth naming rather than reaching os.makedirs
+    and surfacing as a traceback under an exit code that means
+    something else.
+    """
+    raw = CFG["page"]["path"]
+    target = expand_home(raw)
+    if not os.path.isabs(target):
+        raise Refused(2, "page.path must be absolute or start with ~: %s"
+                      % raw)
+    if os.path.isdir(target):
+        raise Refused(2, "page.path is a directory: %s" % target)
+    parent = os.path.dirname(target)
+    if os.path.exists(parent) and not os.access(parent, os.W_OK):
+        raise Refused(2, "page.path is not writable: %s" % parent)
+    return target
+
+
+def write_page(html_text):
+    """Atomic, private, and never a partial file.
+
+    mkstemp in the destination directory rather than a fixed .tmp name:
+    a fixed name is a handle another process can hold, and a rename
+    across filesystems is not atomic.
+    """
+    target = page_target()
+    os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target))
+    try:
+        # utf-8 explicitly, not the locale codec: the page carries
+        # whatever the ledger recorded, and a C locale would fail the
+        # build on the first character outside ASCII.
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(html_text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+    return target
+
+
+def _check_sort():
+    by = CFG["sort"]["by"]
+    direction = CFG["sort"]["dir"]
+    if by not in SORT_KEYS or direction not in SORT_DIRS:
+        raise Refused(2, "sort.by must be one of %s; sort.dir must be "
+                        "one of %s" % (", ".join(SORT_KEYS),
+                                       ", ".join(SORT_DIRS)))
+
+
+def page_html():
+    """The whole page as a string, from a fresh read of both siblings.
+
+    Raises Refused for anything a caller should report rather than
+    render: bad config, a missing or too-old sibling, one that did not
+    answer in time.
+    """
+    _check_sort()
+    versions, logbook_body, hail_body = _fetch_both()
+    # One clock for the whole build. Every age on the page is taken
+    # against it, so two readouts on one page cannot disagree.
+    built_at = _now_iso()
+    everything = build_items(logbook_body, hail_body, built_at)
+    items, hidden = only_open_rows(everything)
+    meta = page_meta(logbook_body, hail_body, built_at=built_at,
+                     versions=versions)
+    meta["hidden"] = hidden
+    listed, dropped = session_list(hail_body)
+    return render(items, meta, aside_items(everything), listed, dropped)
+
+
+def cmd_build(args, open_page):
+    if args:
+        print("chartroom build: unexpected argument: %s" % args[0],
+              file=sys.stderr)
+        return 2
+    try:
+        path = write_page(page_html())
+    except Refused as exc:
+        print("chartroom: %s" % exc, file=sys.stderr)
+        return exc.code
+    print(path)
+    if open_page:
+        try:
+            webbrowser.open("file://" + path)
+        except Exception:
+            pass
+    return 0
+
+
+# ---------------------------------------------------------------------
+# serve
+#
+# A socket where there was only a file. Everything below is about what
+# it refuses. The page carries parked work, branch names and the prose
+# of every obligation, and until this subcommand the only thing between
+# that and another process on this machine was file permissions.
+
+LOOPBACK_HOSTS = frozenset(("127.0.0.1", "localhost", "[::1]", "::1"))
+
+
+class PageHandler(http.server.BaseHTTPRequestHandler):
+    """One path, one method, one caller who knows the token."""
+
+    protocol_version = "HTTP/1.1"
+    server_version = "chartroom"
+    sys_version = ""
+    # a connection that says nothing must not own the socket forever
+    timeout = 15
+
+    def _send(self, status, body, content_type="text/plain; charset=utf-8"):
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        # one request per connection. Keep-alive would leave the
+        # handler sitting in a finished connection waiting for a second
+        # request that a browser reloading the page never sends there.
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        # the page is rebuilt per request, and the URL carries the
+        # token: neither belongs in a cache a later reader can reach
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _host_is_loopback(self):
+        """The browser sets Host and a page on the open web cannot
+        forge it. That is the whole defence against a name on the
+        internet resolving to 127.0.0.1 and pointing a victim's browser
+        at this socket."""
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0]
+        return host in LOOPBACK_HOSTS
+
+    def _authorised(self):
+        query = urllib.parse.urlparse(self.path).query
+        given = urllib.parse.parse_qs(query).get("t", [""])[0]
+        return hmac.compare_digest(given, self.server.token)
+
+    def do_GET(self):
+        if not self._host_is_loopback():
+            self._send(403, "chartroom serves 127.0.0.1 only\n")
+            return
+        if not self._authorised():
+            self._send(403, "no\n")
+            return
+        if urllib.parse.urlparse(self.path).path != "/":
+            self._send(404, "chartroom serves one page, at /\n")
+            return
+        try:
+            body = page_html()
+        except Refused as exc:
+            # a refusal is news for the reader, not a stack trace: the
+            # sibling that would not answer is named, as the terminal
+            # would name it
+            self._send(503, "chartroom: %s\n" % exc)
+            return
+        self._send(200, body, "text/html; charset=utf-8")
+
+    def do_POST(self):
+        self._send(405, "chartroom reads. It never writes back.\n")
+
+    do_PUT = do_DELETE = do_PATCH = do_POST
+
+    def log_message(self, fmt, *args):
+        """The token lives in the query string, so the query string
+        never reaches the log."""
+        line = fmt % args
+        sys.stderr.write("%s\n" % line.split("?")[0])
+
+
+class PageServer(http.server.ThreadingHTTPServer):
+    """Threaded, so one connection cannot take the page away.
+
+    Any process on this machine can open a socket here and then say
+    nothing. Single-threaded, that one connection owns the accept loop
+    and the owner's own reload hangs behind it - a local denial of
+    service needing no token at all. A thread per connection, plus the
+    handler's read timeout, bounds what a silent caller can hold.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = False
+
+    def __init__(self, address, handler, token):
+        http.server.ThreadingHTTPServer.__init__(self, address, handler)
+        self.token = token
+
+
+def build_server(port):
+    """Bound, tokened, and loopback only.
+
+    The token is the access control. Every process on this machine can
+    reach a loopback port, so binding alone protects nothing; a secret
+    in the URL means a process must already be able to read this
+    terminal's output to get in.
+    """
+    if not isinstance(port, int) or isinstance(port, bool) \
+            or not 0 <= port <= 65535:
+        raise Refused(2, "serve.port must be a port number, not %r" % port)
+    try:
+        return PageServer(("127.0.0.1", port), PageHandler,
+                          secrets.token_urlsafe(32))
+    except OSError as exc:
+        raise Refused(5, "cannot listen on 127.0.0.1:%d: %s. Another "
+                         "chartroom may already be serving; change "
+                         "serve.port or stop it." % (port, exc))
+
+
+def cmd_serve(args, open_page):
+    port = CFG["serve"]["port"]
+    if args[:1] == ["--port"]:
+        if len(args) < 2 or not args[1].isdigit():
+            print("chartroom serve: --port takes a number",
+                  file=sys.stderr)
+            return 2
+        port, args = int(args[1]), args[2:]
+    if args:
+        print("chartroom serve: unexpected argument: %s" % args[0],
+              file=sys.stderr)
+        return 2
+    try:
+        _check_sort()
+        server = build_server(port)
+    except Refused as exc:
+        print("chartroom: %s" % exc, file=sys.stderr)
+        return exc.code
+    url = "http://127.0.0.1:%d/?t=%s" % (server.server_address[1],
+                                         server.token)
+    # flushed, because serve_forever never returns: stdout is
+    # block-buffered into a pipe, and the one line a caller needs would
+    # sit in the buffer until the process was killed, taking the token
+    # with it
+    print(url, flush=True)
+    print("rebuilt on every request. ctrl-c to stop.",
+          file=sys.stderr, flush=True)
+    if open_page:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("", file=sys.stderr)
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_doctor(args):
+    """Settings in force, and the two window findings. Writes nothing.
+
+    Makes the same four calls as build, under the same timeout: a
+    doctor reporting on config it had not actually fetched would be the
+    wrong kind of quiet.
+    """
+    if args:
+        print("chartroom doctor: unexpected argument: %s" % args[0],
+              file=sys.stderr)
+        return 2
+    print("config: %s (%s)" % (
+        CONFIG_SOURCE["path"],
+        "exists" if os.path.exists(CONFIG_SOURCE["path"]) else "absent"))
+    if CONFIG_SOURCE["fatal"]:
+        print("fatal: %s" % CONFIG_SOURCE["fatal"])
+        return 4
+    for warning in CONFIG_SOURCE["warnings"]:
+        print("warning: %s" % warning)
+    print("page.path: %s" % CFG["page"]["path"])
+    print("page.open: %s" % CFG["page"]["open"])
+    print("rows.only_open: %s  rows.blocking_only: %s"
+          % (CFG["rows"]["only_open"], CFG["rows"]["blocking_only"]))
+    print("sessions.limit: %s" % CFG["sessions"]["limit"])
+    print("sort.by: %s  sort.dir: %s"
+          % (CFG["sort"]["by"], CFG["sort"]["dir"]))
+
+    try:
+        _check_sort()
+        versions, logbook_body, hail_body = _fetch_both()
+    except Refused as exc:
+        print("chartroom: %s" % exc, file=sys.stderr)
+        return exc.code
+
+    print("siblings: logbook %s  hail %s"
+          % (versions["logbook"], versions["hail"]))
+    days = hail_body.get("days") or 0
+    print("logbook thresholds: %s"
+          % json.dumps(logbook_body.get("thresholds") or {}, sort_keys=True))
+    print("hail index.days: %d  census: %s"
+          % (days, json.dumps(hail_body.get("census") or {},
+                              sort_keys=True)))
+
+    print("logbook kinds: %s" % ", ".join(
+        "%s%s" % (name, "" if spec.get("blocking", True) else " (aside)")
+        for name, spec in sorted(
+            (logbook_body.get("kinds") or {}).items())))
+
+    findings = []
+    if CFG["rows"]["blocking_only"] and not aside_kinds(logbook_body):
+        findings.append(
+            "rows.blocking_only is on and logbook marks no kind "
+            "non-blocking, so nothing is ever set aside. Either it is "
+            "doing nothing, or a kind that belongs on record is being "
+            "shown as work.")
+    if days < 30:
+        findings.append(
+            "index.days is %d. chartroom is a page about what is "
+            "owed, and obligations run for months; raise hail's "
+            "index.days." % days)
+
+    if not findings:
+        print("no findings")
+        return 0
+    print("findings:")
+    for finding in findings:
+        print("  %s" % finding)
+    return 1
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--version"]:
+        print(VERSION)
+        return 0
+    command = argv[0] if argv else None
+    if CONFIG_SOURCE["fatal"] and command != "doctor":
+        print("chartroom: %s" % CONFIG_SOURCE["fatal"], file=sys.stderr)
+        return 4
+    if command is None:
+        return cmd_build([], CFG["page"]["open"])
+    if command == "build":
+        return cmd_build(argv[1:], False)
+    if command == "serve":
+        return cmd_serve(argv[1:], CFG["serve"]["open"])
+    if command == "doctor":
+        return cmd_doctor(argv[1:])
+    print("usage: chartroom [build|serve|doctor|--version]",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

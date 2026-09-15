@@ -1,0 +1,10 @@
+{
+  "name": "logbook",
+  "description": "Cross-session record of open obligations, with a session-start brief and a merge gate",
+  "version": "0.3.3",
+  "author": { "name": "Nikunj Trapasiya" },
+  "homepage": "https://github.com/nikunjtrapasiya/binnacle",
+  "repository": "https://github.com/nikunjtrapasiya/binnacle",
+  "license": "MIT",
+  "keywords": ["ledger", "obligations", "hooks", "session", "handover"]
+}

@@ -1,0 +1,34 @@
+{
+  "name": "binnacle",
+  "owner": { "name": "Nikunj Trapasiya" },
+  "metadata": {
+    "description": "Instruments for steering work across sessions",
+    "version": "0.5.4"
+  },
+  "plugins": [
+    {
+      "name": "logbook",
+      "source": "./logbook",
+      "description": "Cross-session record of open obligations, with a session-start brief and a merge gate",
+      "version": "0.3.3",
+      "category": "workflow",
+      "keywords": ["ledger", "obligations", "hooks", "session", "handover"]
+    },
+    {
+      "name": "hail",
+      "source": "./hail",
+      "description": "Find a past session by ticket, branch, title, directory or what you typed into it, and rejoin it",
+      "version": "0.2.4",
+      "category": "workflow",
+      "keywords": ["sessions", "index", "search", "resume", "transcripts"]
+    },
+    {
+      "name": "chartroom",
+      "source": "./chartroom",
+      "description": "One page joining logbook's open obligations to the hail sessions that worked them",
+      "version": "0.4.3",
+      "category": "workflow",
+      "keywords": ["sessions", "obligations", "ledger", "page", "handover"]
+    }
+  ]
+}

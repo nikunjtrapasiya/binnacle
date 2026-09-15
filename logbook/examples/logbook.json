@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "ticket": {
+    "pattern": "[A-Z]{2,6}-\\d{1,7}",
+    "example": "ABC-123",
+    "tracker_name": "Jira"
+  },
+  "deploy": {
+    "timeout_seconds": 60,
+    "stages": {
+      "prod": { "resolve": "$LOGBOOK_CONFIG_DIR/deployed-commit-aws-logs.sh" },
+      "test": { "resolve": "$LOGBOOK_CONFIG_DIR/deployed-commit-aws-logs.sh" },
+      "preview-*": { "exists": "$LOGBOOK_CONFIG_DIR/stage-exists-aws-ssm.sh" }
+    }
+  },
+  "gate": {
+    "tracker_tools": [
+      { "tool": "mcp__claude_ai_Atlassian__transitionJiraIssue",
+        "issue_field": "issueIdOrKey",
+        "status_path": "transition.name",
+        "opaque_path": "transition.id" }
+    ]
+  }
+}
