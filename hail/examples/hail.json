@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "index": {
+    "days": 10,
+    "prompts": 2,
+    "prompt_chars": 300
+  },
+  "ticket": {
+    "pattern": "[A-Z]{2,6}-\\d{1,7}",
+    "reserved": ["ISO", "UTF", "SHA", "AES", "RGB", "RFC", "HTTP", "IPV"]
+  },
+  "scan": {
+    "transcripts": "~/.claude/projects",
+    "live": "~/.claude/sessions",
+    "min_sample": 5,
+    "min_bytes": 1048576,
+    "ignore_prefixes": [
+      "<command-", "<local-command", "<system-reminder", "Caveat:",
+      "Base directory for this skill", "The following skills",
+      "ARGUMENTS:", "This session is being continued",
+      "Note: /Users", "Result of calling", "Called the ",
+      "<bash-input", "<bash-stdout", "<ide-", "[Request interrupted",
+      "<task-notification"
+    ]
+  }
+}

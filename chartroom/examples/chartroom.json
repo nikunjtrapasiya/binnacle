@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "page": {
+    "path": "~/.claude/binnacle/chartroom/chartroom.html",
+    "open": true
+  },
+  "sort": {
+    "by": "age",
+    "dir": "asc"
+  },
+  "rows": {
+    "only_open": true,
+    "blocking_only": true
+  },
+  "sessions": {
+    "limit": 60
+  },
+  "serve": {
+    "port": 8787,
+    "open": true
+  },
+  "tools": {
+    "logbook": "logbook",
+    "hail": "hail",
+    "timeout_seconds": 20
+  }
+}
