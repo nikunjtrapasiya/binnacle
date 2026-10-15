@@ -1,0 +1,1705 @@
+#!/usr/bin/env python3
+"""Cross-session ledger of open obligations, keyed by ticket or PR.
+
+  logbook add --kind K --text T ...   record an obligation
+  logbook ls / show / resolve / drop  work the list
+  logbook check --ticket K            close-out gate, exit 1 on blockers
+  logbook brief                       SessionStart injection
+
+Append-only log under ~/.claude/binnacle/logbook by default; `home` in
+the config and LOGBOOK_HOME override it, and `logbook doctor` prints
+the path in force. State is a replay, so concurrent sessions in
+separate checkouts never clobber each other.
+
+Stores obligations and decisions only. Anything with an authoritative
+source is queried when it matters, never cached.
+"""
+import argparse
+import binascii
+import datetime
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+
+import copy
+import fnmatch
+
+DEFAULTS = {
+    "version": 1,
+    "home": "~/.claude/binnacle/logbook",
+    "ticket": {
+        "pattern": r"[A-Z]{2,6}-\d{1,7}",
+        "reserved": ["ISO", "UTF", "SHA", "AES", "RGB", "RFC", "HTTP",
+                     "IPV"],
+        "example": "ABC-123",
+        "tracker_name": "your tracker",
+    },
+    "thresholds": {
+        "followup_cap": 3,
+        "followup_expiry_days": 14,
+        "stale_days": 7,
+    },
+    "kinds": {
+        "parked": {"requires": ["resume"], "blocking": True},
+        "blocked": {"requires": ["unblocked_by"], "blocking": True},
+        "followup": {"requires": ["ticket"], "blocking": True,
+                     "capped": True},
+        "unverified": {"requires": ["verify"], "blocking": True},
+        "deploy": {"requires": ["stage", "service", "commit"],
+                   "blocking": True},
+        "decision": {"requires": ["why"], "blocking": False},
+    },
+    "gate": {
+        "mode": "ask",
+        "done_words": ["done", "closed", "resolved", "complete"],
+        "pr_close_patterns": [
+            r"\bgh\s+pr\s+(?:merge|close|ready)\b",
+            r"\bgh\s+api\b[^;&|\n]*?/pulls/(\d+)/merge",
+        ],
+        "tracker_tools": [],
+    },
+    "brief": {"remote_text": False},
+    "deploy": {"timeout_seconds": 60, "stages": {}},
+    "retire": {"timeout_seconds": 60, "kinds": ["decision"],
+               "ticket": "", "pr": ""},
+    "hail": {"index": "~/.claude/binnacle/hail/index.json"},
+}
+CONFIG_PATH_DEFAULT = "~/.claude/binnacle/logbook.json"
+CONFIG_VERSION = 1
+VERSION = "0.4.2"
+
+
+def config_path():
+    return os.path.expanduser(os.environ.get("LOGBOOK_CONFIG")
+                              or CONFIG_PATH_DEFAULT)
+
+
+def load_config(path=None):
+    """Merged config and a record of where each section came from."""
+    path = path or config_path()
+    cfg = copy.deepcopy(DEFAULTS)
+    source = {"path": path, "loaded": False,
+              "origin": dict((k, "default") for k in cfg),
+              "warnings": [], "fatal": None}
+    if not os.path.exists(path):
+        return cfg, source
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as exc:
+        # fatal, not a warning: silently running defaults means running
+        # a policy the user did not write, and a stricter one they did
+        # write - a lower cap, gate mode deny - is quietly discarded
+        source["fatal"] = "config could not be read: %s" % exc
+        return cfg, source
+    if not isinstance(raw, dict):
+        source["fatal"] = "config is not an object: %s" % path
+        return cfg, source
+    if raw.get("version") != CONFIG_VERSION:
+        source["fatal"] = ("config version %r is not %d: %s"
+                           % (raw.get("version"), CONFIG_VERSION, path))
+        return cfg, source
+    for key, value in raw.items():
+        if key == "version":
+            continue
+        if key not in cfg:
+            source["warnings"].append("unknown config key ignored: %s" % key)
+            continue
+        if not type_ok(value, cfg[key]):
+            # a wrong scalar type used to traceback at import, which took
+            # doctor down with it - the one command meant to explain this
+            source["warnings"].append(
+                "config key %s must be %s, keeping the default"
+                % (key, type(cfg[key]).__name__))
+            continue
+        if isinstance(cfg[key], dict):
+            # a section arriving as a scalar must warn, not traceback later
+            if not isinstance(value, dict):
+                source["warnings"].append(
+                    "config key %s must be an object, ignored" % key)
+                continue
+            if key == "kinds":
+                clean = {}
+                for kind, spec in value.items():
+                    if isinstance(spec, dict):
+                        clean[kind] = spec
+                    else:
+                        source["warnings"].append(
+                            "kind %s must be an object, ignored" % kind)
+                if clean:
+                    cfg[key] = clean
+                else:
+                    source["warnings"].append(
+                        "config declares no usable kinds, using defaults")
+                    continue
+            else:
+                for leaf, item in value.items():
+                    default = cfg[key].get(leaf)
+                    # a nested leaf of the wrong type used to reach the
+                    # code that formats it and traceback there, taking
+                    # doctor with it
+                    if default is not None and not type_ok(item, default):
+                        source["warnings"].append(
+                            "config key %s.%s must be %s, keeping the "
+                            "default" % (key, leaf,
+                                         type(default).__name__))
+                        continue
+                    cfg[key][leaf] = item
+        else:
+            cfg[key] = value
+        source["origin"][key] = "file"
+    source["loaded"] = True
+    return cfg, source
+
+
+def type_ok(value, default):
+    """Same shape as the default, with int and float interchangeable."""
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return (isinstance(value, (int, float))
+                and not isinstance(value, bool))
+    return isinstance(value, type(default))
+
+
+def pattern_normalises(pattern):
+    """Would keys this pattern matches survive normalisation?
+
+    The old check looked for a literal "-" in the pattern's source,
+    which "[A-Z]" satisfies, so it never fired. Keys are upper-cased
+    and split on "-", so what matters is whether a matched key carries
+    one - ask the pattern itself.
+    """
+    try:
+        probe = re.compile(r"\b(?:%s)\b" % pattern)
+    except re.error:
+        return True
+    for candidate in ("ABC-123", "AB-1", "ABCDEF-1234567"):
+        found = probe.search(candidate)
+        if found and "-" in found.group(0):
+            return True
+    return False
+
+
+def compile_ticket(pattern, warnings):
+    try:
+        return re.compile(r"\b(?:%s)\b" % pattern)
+    except re.error as exc:
+        warnings.append("ticket.pattern uncompilable, using default: %s"
+                        % exc)
+        return re.compile(r"\b(?:%s)\b" % DEFAULTS["ticket"]["pattern"])
+
+
+CFG, CONFIG_SOURCE = load_config()
+
+LEDGER_HOME = (os.environ.get("LOGBOOK_HOME")
+               or os.path.expanduser(CFG["home"]))
+LOG = os.path.join(LEDGER_HOME, "events.jsonl")
+# Single sub-4KB write under O_APPEND is atomic; cap fields well below it.
+MAX_FIELD = 1000
+TICKET = compile_ticket(CFG["ticket"]["pattern"],
+                        CONFIG_SOURCE["warnings"])
+NOT_TICKETS = set(CFG["ticket"]["reserved"])
+TICKET_EXAMPLE = CFG["ticket"]["example"]
+TRACKER_NAME = CFG["ticket"]["tracker_name"]
+SHAPE = dict((kind, tuple(spec.get("requires") or ()))
+             for kind, spec in CFG["kinds"].items())
+KINDS = tuple(SHAPE)
+BLOCKING_KINDS = frozenset(
+    kind for kind, spec in CFG["kinds"].items()
+    if spec.get("blocking", True))
+CAPPED_KINDS = frozenset(
+    kind for kind, spec in CFG["kinds"].items() if spec.get("capped"))
+FOLLOWUP_CAP = CFG["thresholds"]["followup_cap"]
+FOLLOWUP_EXPIRY_DAYS = CFG["thresholds"]["followup_expiry_days"]
+STALE_DAYS = CFG["thresholds"]["stale_days"]
+BRIEF_REMOTE_TEXT = CFG["brief"]["remote_text"]
+GATE = CFG["gate"]
+DEPLOY = CFG["deploy"]
+RETIRE = CFG["retire"]
+SESSION_INDEX = os.path.expanduser(CFG["hail"]["index"])
+MAX_EVENT = 3500
+# never shortened: the keys every lookup and every guard depends on.
+# branch joins them because it routes an entry to a work item when
+# there is no ticket; repo_path deliberately does not, because losing
+# the write is worse than misfiling one row.
+KEYS_KEPT_WHOLE = ("id", "ts", "op", "kind", "ticket", "pr", "status",
+                   "branch")
+MAX_RESOLVER_OUTPUT = 64 * 1024
+ZERO_WIDTH = "\u200b\u200c\u200d\ufeff"
+LOG_KEYS = frozenset(("id", "ts", "op", "kind", "status", "note", "text",
+                      "repo", "repo_path", "branch", "session"))
+IDENTIFIER_FIELDS = frozenset(("stage", "service", "commit", "ticket",
+                               "pr"))
+FIELD_NAME = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
+# each has a typed flag, so --field would bypass its normalisation
+TYPED_FLAGS = frozenset(("ticket", "pr"))
+MIN_VALUE_CHARS = 3
+
+
+def is_blocking(kind):
+    """Undeclared kinds block.
+
+    A kind renamed or removed in config must not disarm close-out for
+    entries already written under the old name.
+    """
+    spec = CFG["kinds"].get(kind)
+    if spec is None:
+        return True
+    return bool(spec.get("blocking", True))
+
+
+class ShapeError(Exception):
+    def __init__(self, kind, missing):
+        self.kind = kind
+        self.missing = missing
+        super().__init__(
+            "%s needs %s. Item that cannot name %s is ticket-shaped: "
+            "raise it in %s, do not park it here."
+            % (kind, ", ".join(missing), "/".join(missing), TRACKER_NAME))
+
+
+class CapError(Exception):
+    pass
+
+
+def filled(value):
+    if value is None or isinstance(value, bool):
+        return False
+    if isinstance(value, str):
+        # str.strip() leaves zero-width chars, which read as empty
+        for ch in ZERO_WIDTH:
+            value = value.replace(ch, "")
+        return bool(value.strip())
+    return bool(value)
+
+
+def truncate(s, limit=MAX_FIELD):
+    if s is None:
+        return None
+    s = str(s)
+    return s if len(s) <= limit else s[:limit - 3] + "..."
+
+
+def shrink(event):
+    """Shrink event under MAX_EVENT bytes, kept-whole keys spared.
+
+    Returns the shrunk dict, or raises ValueError naming what would
+    not shrink when nothing shrinkable remains.
+    """
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    while len(line.encode("utf-8")) > MAX_EVENT:
+        longest_key = None
+        longest_len = 0
+        for k, v in event.items():
+            if k not in KEYS_KEPT_WHOLE:
+                if isinstance(v, str) and len(v) > longest_len:
+                    longest_key = k
+                    longest_len = len(v)
+        if longest_key is None:
+            # nothing left to shrink, and the line is still over the
+            # size a single append is atomic at. Writing it anyway
+            # voided that guarantee silently, so refuse instead.
+            big = sorted(
+                ((len(v), k) for k, v in event.items()
+                 if isinstance(v, str) and len(v) > 64),
+                reverse=True)
+            culprit = ("The unshrinkable %s is %d characters."
+                       % (big[0][1], big[0][0]) if big else
+                       "Use fewer fields.")
+            raise ValueError(
+                "event is %d bytes, over the %d-byte limit a single "
+                "append is atomic at, and nothing left can be "
+                "shortened. %s"
+                % (len(line.encode("utf-8")), MAX_EVENT, culprit))
+        value = event[longest_key]
+        if len(value) > 8:
+            # marked, so a reader can tell the value was cut - the old
+            # halving was silent and asymmetric
+            event[longest_key] = value[:len(value) // 2 - 3] + "..."
+        else:
+            # too short to shrink further and still say anything; drop it
+            # rather than spin, and let the loop reconsider what is left
+            del event[longest_key]
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+    return event
+
+
+def append(event):
+    # entry text is the most sensitive thing this tool stores; a
+    # fresh directory or file must never be briefly world-readable
+    os.makedirs(LEDGER_HOME, exist_ok=True, mode=0o700)
+    for k, v in event.items():
+        if isinstance(v, str):
+            event[k] = v.encode("utf-8", "replace").decode("utf-8")
+    event = shrink(event)
+    line = json.dumps(event, ensure_ascii=False) + "\n"
+    fd = os.open(LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8",
+                  errors="surrogateescape") as fh:
+        fh.write(line)
+
+
+def read_events():
+    if not os.path.exists(LOG):
+        return []
+    out = []
+    # explicit encoding: the size budget is computed in UTF-8 bytes, and
+    # under a non-UTF-8 locale the bytes written would not match it
+    with open(LOG, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            # torn write can leave valid JSON that is not an object
+            if isinstance(ev, dict):
+                out.append(ev)
+    return out
+
+
+def replay(events):
+    entries = {}
+    for ev in events:
+        eid = ev.get("id")
+        if not eid:
+            continue
+        op = ev.get("op")
+        if op == "add":
+            entry = dict(ev)
+            entry.pop("op", None)
+            entry["status"] = "open"
+            entries[eid] = entry
+        elif op in ("resolve", "drop") and eid in entries:
+            entries[eid]["status"] = (
+                "resolved" if op == "resolve" else "dropped")
+            entries[eid]["closed_ts"] = ev.get("ts")
+            if ev.get("note"):
+                entries[eid]["note"] = ev["note"]
+    return entries
+
+
+def active(entries):
+    return sorted(
+        (e for e in entries.values() if e.get("status") == "open"),
+        key=lambda e: e.get("ts") or "",
+    )
+
+
+def infer_ticket(branch):
+    if not branch:
+        return None
+    for match in TICKET.finditer(branch.upper().replace("/", "-")):
+        key = match.group(0)
+        if key.split("-")[0] in NOT_TICKETS:
+            continue
+        return key
+    return None
+
+
+def check_shape(kind, fields):
+    if kind not in SHAPE:
+        raise ValueError(
+            "unknown kind %r; one of %s" % (kind, ", ".join(KINDS)))
+    missing = [f for f in SHAPE[kind] if not filled(fields.get(f))]
+    if missing:
+        raise ShapeError(kind, missing)
+    if kind in CAPPED_KINDS:
+        # cap groups by this value, so unnormalized keys mint fresh budgets
+        key = infer_ticket(str(fields.get("ticket") or ""))
+        if key is None:
+            raise ShapeError(kind, ["ticket"])
+        fields["ticket"] = key
+
+
+def check_cap(kind, fields, entries):
+    if kind not in CAPPED_KINDS:
+        return
+    ticket = fields.get("ticket")
+    open_now = sum(
+        1 for e in active(entries)
+        if e.get("kind") == kind and e.get("ticket") == ticket)
+    if open_now >= FOLLOWUP_CAP:
+        raise CapError(
+            "%s already has %d open %s entries (cap %d). %d deferrals in "
+            "one ticket means the scope was wrong: promote one to %s or "
+            "resolve it." % (ticket, open_now, kind, FOLLOWUP_CAP,
+                             FOLLOWUP_CAP, TRACKER_NAME))
+
+
+def parse_fields(pairs):
+    """--field name=value pairs into a dict, refusing names the log owns."""
+    out = {}
+    for pair in pairs or ():
+        name, sep, value = pair.partition("=")
+        if not sep:
+            raise ValueError("--field needs name=value, got %r" % pair)
+        if not FIELD_NAME.match(name):
+            raise ValueError(
+                "bad field name %r: lowercase, digits and underscore, "
+                "starting with a letter" % name)
+        if name in LOG_KEYS:
+            raise ValueError("field name %r is reserved by the log" % name)
+        if name in TYPED_FLAGS:
+            # pr through --field arrived as a string, which check --pr
+            # could not match and the keyless warning treated as set:
+            # an entry that blocked nothing and was reported by nothing
+            raise ValueError(
+                "field name %r has its own flag, use --%s"
+                % (name, name.replace("_", "-")))
+        if name in out:
+            raise ValueError("field %r given twice" % name)
+        out[name] = truncate(value)
+    return out
+
+
+def check_values(kind, fields):
+    """Required values must carry something a reader can act on."""
+    text = re.sub(r"\s+", " ", str(fields.get("text") or "")).strip().lower()
+    missing = []
+    for name in SHAPE.get(kind, ()):
+        value = fields.get(name)
+        if name in IDENTIFIER_FIELDS:
+            continue
+        flat = re.sub(r"\s+", " ", str(value or "")).strip()
+        if len(flat) < MIN_VALUE_CHARS:
+            missing.append(name)
+        elif flat.lower() == text:
+            raise ShapeError(kind, [name + " (same as text)"])
+    if missing:
+        raise ShapeError(kind, missing)
+
+
+def sh(args, cwd=None):
+    try:
+        out = subprocess.run(args, cwd=cwd, capture_output=True,
+                             text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip() if out.returncode == 0 else None
+
+
+def git_context(cwd=None):
+    cwd = cwd or os.getcwd()
+    top = sh(["git", "rev-parse", "--show-toplevel"], cwd)
+    if not top:
+        return {}
+    branch = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    # detached HEAD returns the literal string "HEAD", not a branch
+    # name - that string would become a join key downstream, merging
+    # unrelated checkouts' entries into one row
+    if branch == "HEAD":
+        branch = None
+    ctx = {"repo": os.path.basename(top),
+           # the path too: a basename cannot tell deploy-sync which
+           # checkout to compare commits in
+           "repo_path": top,
+           "branch": branch,
+           "commit": sh(["git", "rev-parse", "HEAD"], cwd)}
+    return {k: v for k, v in ctx.items() if v}
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(
+        timespec="seconds")
+
+
+def new_id(entries):
+    while True:
+        cand = binascii.hexlify(os.urandom(4)).decode()
+        if cand not in entries:
+            return cand
+
+
+def cmd_add(args):
+    entries = replay(read_events())
+    ctx = git_context()
+    if not filled(args.text):
+        print("refused: text must be non-blank", file=sys.stderr)
+        return 2
+    fields = {
+        "kind": args.kind,
+        "text": truncate(args.text),
+        "why": truncate(args.why),
+        "ticket": args.ticket or infer_ticket(ctx.get("branch")),
+        "pr": args.pr,
+        "stage": args.stage,
+        "service": args.service,
+        "verify": truncate(args.verify),
+        "resume": truncate(args.resume),
+        "unblocked_by": truncate(args.unblocked_by),
+    }
+    if args.kind == "deploy":
+        fields["commit"] = args.commit or ctx.get("commit")
+
+    try:
+        extra = parse_fields(args.field)
+    except ValueError as exc:
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
+    for name, value in extra.items():
+        if filled(fields.get(name)):
+            print("refused: %s given twice, once as a flag and once as "
+                  "--field" % name, file=sys.stderr)
+            return 2
+        fields[name] = value
+
+    if fields["ticket"]:
+        # every kind keys on this, so canonical form or nothing
+        key = infer_ticket(str(fields["ticket"]))
+        if key is None:
+            print("refused: --ticket %r is not a ticket key like %s"
+                  % (args.ticket, TICKET_EXAMPLE), file=sys.stderr)
+            return 2
+        fields["ticket"] = key
+
+    try:
+        check_shape(args.kind, fields)
+        check_values(args.kind, fields)
+        check_cap(args.kind, fields, entries)
+    except ShapeError as exc:
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
+    except CapError as exc:
+        print("refused: %s" % exc, file=sys.stderr)
+        return 3
+
+    event = {"op": "add", "id": new_id(entries), "ts": now_iso()}
+    event.update({k: v for k, v in ctx.items() if k != "commit"})
+    session = args.session or os.environ.get("CLAUDE_SESSION_ID")
+    if session:
+        event["session"] = session
+    event.update({k: v for k, v in fields.items()
+                  if filled(v) or (k == "pr" and v is not None)})
+    try:
+        append(event)
+    except ValueError as exc:
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
+
+    if not event.get("ticket") and not event.get("pr"):
+        print("%s written WITHOUT ticket or pr. Attach one with --ticket %s "
+              "or it will be hard to find later." % (event["id"],
+                                                     TICKET_EXAMPLE),
+              file=sys.stderr)
+    print(event["id"])
+    return 0
+
+
+def resume_hint(session_id):
+    """`cd <cwd> && claude -r <id>` from the session index, if present."""
+    if not session_id or not os.path.exists(SESSION_INDEX):
+        return None
+    try:
+        with open(SESSION_INDEX) as fh:
+            index = json.load(fh)
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(index, dict):
+        return None
+    sessions = index.get("sessions", index)
+    if isinstance(sessions, dict):
+        sessions = list(sessions.values())
+    if not isinstance(sessions, list):
+        return None
+    for rec in sessions:
+        if not isinstance(rec, dict):
+            continue
+        sid = rec.get("id") or rec.get("session_id")
+        if not isinstance(sid, str) or not filled(sid):
+            continue
+        if sid.startswith(session_id) or session_id.startswith(sid):
+            cwd = rec.get("cwd")
+            if isinstance(cwd, str) and filled(cwd):
+                return "cd %s && claude -r %s" % (shlex.quote(cwd), sid)
+    return None
+
+
+def flat(value):
+    """One line, for the compact view."""
+    return re.sub(r"\s+", " ", str(value if value is not None else "")).strip()
+
+
+def indented(value, pad):
+    """Keep the line breaks, but never start a line at column 0.
+
+    Recorded text can come from material an agent read, so an entry
+    whose text begins a line with our own framing would read as this
+    tool talking. Multi-line values stay readable; they just cannot
+    impersonate the output around them.
+    """
+    text = str(value if value is not None else "")
+    lines = [l.rstrip() for l in text.splitlines()] or [""]
+    return ("\n" + pad).join(lines)
+
+
+def format_entry(entry, verbose=False, text=True):
+    if text:
+        body = entry.get("text", "")
+        body = indented(body, " " * 30) if verbose else flat(body)
+    else:
+        # The brief runs at every session start, so whatever it prints
+        # is sent to the model. An entry on another ticket still has to
+        # be noticeable, but its text is the part this session has no
+        # business receiving. Age is what makes the row worth reading.
+        # An unparseable ts ages to inf, and such an entry is always
+        # stale, so it always reaches here: "%d" % inf raises.
+        age = age_days(entry)
+        body = "age unknown" if age == float("inf") else "%dd old" % age
+    head = "  %s  %-10s %-10s %s" % (
+        entry.get("id", "?"), entry.get("kind", "?"),
+        entry.get("ticket") or entry.get("pr") or "-",
+        body)
+    if entry.get("status") != "open":
+        head += "  [%s]" % entry["status"]
+    if not verbose:
+        return head
+    lines = [head]
+    required = SHAPE.get(entry.get("kind"), ())
+    deploy_line = entry.get("kind") == "deploy"
+    shown = set(("stage", "service", "commit")) if deploy_line else set()
+    for field in list(required) + ["why", "note"]:
+        if field in shown or field not in entry or not entry.get(field):
+            continue
+        shown.add(field)
+        lines.append("        %s: %s"
+                     % (field, indented(entry[field], " " * 10)))
+    if deploy_line and entry.get("stage"):
+        lines.append("        stage: %s  service: %s  commit: %s"
+                     % (entry.get("stage"), entry.get("service", "-"),
+                        (entry.get("commit") or "-")[:12]))
+    if entry.get("repo"):
+        lines.append("        repo: %s  branch: %s"
+                     % (entry["repo"], entry.get("branch", "-")))
+    hint = resume_hint(entry.get("session"))
+    if hint:
+        lines.append("        rejoin: %s" % hint)
+    return "\n".join(lines)
+
+
+def _select(entries, args):
+    rows = (sorted(entries.values(), key=lambda e: e.get("ts") or "")
+            if getattr(args, "all", False) else active(entries))
+    if getattr(args, "ticket", None):
+        want = infer_ticket(str(args.ticket)) or args.ticket
+        rows = [e for e in rows if e.get("ticket") == want]
+    if getattr(args, "repo", None):
+        rows = [e for e in rows if e.get("repo") == args.repo]
+    if getattr(args, "kind", None):
+        rows = [e for e in rows if e.get("kind") == args.kind]
+    return rows
+
+
+def cmd_ls(args):
+    rows = _select(replay(read_events()), args)
+    if getattr(args, "json", False):
+        # kinds ride along for the same reason thresholds do: a reader
+        # deciding what to put in front of a person needs to know which
+        # kinds block a close-out and which are only on record, and that
+        # is this config's answer to give, not a name list to hardcode.
+        json.dump({"version": 1,
+                   "thresholds": CFG["thresholds"],
+                   "kinds": CFG["kinds"],
+                   "entries": rows}, sys.stdout)
+        print()
+        return 0
+    if not rows:
+        print("nothing open")
+        return 0
+    for entry in rows:
+        print(format_entry(entry))
+    return 0
+
+
+def cmd_show(args):
+    entries = replay(read_events())
+    key = args.key
+    # the same normaliser ls, check and brief use: a bare .upper() here
+    # meant `show feature/abc-1270-auth` found nothing while
+    # `check --ticket feature/abc-1270-auth` found the open item
+    want = infer_ticket(str(key)) or str(key).upper()
+    rows = [e for e in entries.values()
+            if e.get("id") == key or e.get("ticket") == want
+            or str(e.get("pr")) == key]
+    if not rows:
+        print("no entries for %s" % key, file=sys.stderr)
+        return 1
+    for entry in sorted(rows, key=lambda e: e.get("ts") or ""):
+        print(format_entry(entry, verbose=True))
+    return 0
+
+
+def _close(args, op):
+    entries = replay(read_events())
+    if args.id not in entries:
+        print("no entry %s" % args.id, file=sys.stderr)
+        return 1
+    if entries[args.id]["status"] != "open":
+        print("%s already %s" % (args.id, entries[args.id]["status"]),
+              file=sys.stderr)
+        return 1
+    event = {"op": op, "id": args.id, "ts": now_iso()}
+    if args.note:
+        event["note"] = truncate(args.note)
+    append(event)
+    print("%s %s" % (args.id, "resolved" if op == "resolve" else "dropped"))
+    return 0
+
+
+def cmd_resolve(args):
+    return _close(args, "resolve")
+
+
+def cmd_drop(args):
+    return _close(args, "drop")
+
+
+def blockers_for(entries, ticket=None, pr=None):
+    """Open blockers and decisions for a ticket, a PR, or both.
+
+    A PR-keyed check also pulls in the tickets its own entries name, and a
+    ticket-keyed check pulls in the PRs its own entries name, so both
+    obligations are not missed at merge time.
+    """
+    rows = active(entries)
+    tickets = {ticket} if ticket else set()
+    prs = {pr} if pr is not None else set()
+    if pr is not None:
+        for entry in rows:
+            if entry.get("pr") == pr and entry.get("ticket"):
+                tickets.add(entry["ticket"])
+    if ticket:
+        for entry in rows:
+            if entry.get("ticket") == ticket and entry.get("pr") is not None:
+                prs.add(entry["pr"])
+
+    def mine(entry):
+        if entry.get("ticket") and entry["ticket"] in tickets:
+            return True
+        return entry.get("pr") is not None and entry["pr"] in prs
+
+    scoped = [e for e in rows if mine(e)]
+    blockers = [e for e in scoped if is_blocking(e.get("kind"))]
+    decisions = [e for e in scoped if not is_blocking(e.get("kind"))]
+    return blockers, decisions
+
+
+def cmd_check(args):
+    if not args.ticket and args.pr is None:
+        print("refused: check needs --ticket, --pr, or both",
+              file=sys.stderr)
+        return 2
+    entries = replay(read_events())
+    ticket = args.ticket
+    if ticket:
+        key = infer_ticket(str(ticket))
+        if key is None:
+            print("refused: --ticket %r is not a ticket key like %s"
+                  % (ticket, TICKET_EXAMPLE), file=sys.stderr)
+            return 2
+    else:
+        key = None
+    blockers, decisions = blockers_for(entries, key, args.pr)
+    # both keys is what the gate sends for a merge on a ticket branch:
+    # the second PR on a ticket has no entry naming its number yet, so
+    # the ticket-keyed blockers are the ones that matter
+    if key and args.pr is not None:
+        display_key = "PR #%s on %s" % (args.pr, key)
+    else:
+        display_key = key or ("PR #%s" % args.pr)
+
+    keyless = [e for e in active(entries)
+               if not e.get("ticket") and e.get("pr") is None]
+
+    if args.json:
+        out = {"key": display_key, "blockers": blockers,
+               "decisions": decisions, "keyless": len(keyless)}
+        print(json.dumps(out))
+        return 1 if blockers else 0
+
+    if not blockers:
+        if decisions:
+            print("%s clear. Decisions on record:" % display_key)
+            for entry in decisions:
+                print(format_entry(entry))
+        if keyless:
+            plural = "y" if len(keyless) == 1 else "ies"
+            print("%d keyless entr%s open, not covered by this check; "
+                  "attach a ticket" % (len(keyless), plural))
+        return 0
+
+    print("%s has %d open item(s):" % (display_key, len(blockers)))
+    for entry in blockers:
+        print(format_entry(entry, verbose=True))
+    if decisions:
+        print("decisions on record:")
+        for entry in decisions:
+            print(format_entry(entry))
+    if keyless:
+        plural = "y" if len(keyless) == 1 else "ies"
+        print("%d keyless entr%s open, not covered by this check; "
+              "attach a ticket" % (len(keyless), plural))
+    return 1
+
+
+def age_days(entry):
+    try:
+        stamp = datetime.datetime.fromisoformat(entry["ts"])
+    except (KeyError, TypeError, ValueError):
+        # unknown age must surface, not read as brand new
+        return float("inf")
+    now = datetime.datetime.now(stamp.tzinfo)
+    return (now - stamp).total_seconds() / 86400.0
+
+
+def cmd_stale(args):
+    rows = [e for e in active(replay(read_events()))
+            if age_days(e) > args.days]
+    if not rows:
+        print("nothing stale")
+        return 0
+    for entry in rows:
+        age = age_days(entry)
+        shown = "age unknown" if age == float("inf") else "%d days" % age
+        print("%s  (%s)" % (format_entry(entry), shown))
+    return 0
+
+
+def cmd_brief(args):
+    entries = replay(read_events())
+    rows = active(entries)
+    if not rows:
+        return 0
+
+    if args.ticket:
+        ticket = infer_ticket(str(args.ticket)) or args.ticket
+    else:
+        ticket = infer_ticket(git_context().get("branch"))
+    mine = [e for e in rows if ticket and e.get("ticket") == ticket]
+    mine_ids = {e["id"] for e in mine}
+    others = [e for e in rows if e["id"] not in mine_ids]
+
+    expired = [e for e in rows if e.get("kind") == "followup"
+               and age_days(e) > FOLLOWUP_EXPIRY_DAYS]
+    expired_ids = {e["id"] for e in expired}
+    # expiry framing is the actionable one, so it wins the entry
+    mine = [e for e in mine if e["id"] not in expired_ids]
+    others = [e for e in others if e["id"] not in expired_ids]
+    escalate = [e for e in others if e.get("kind") == "blocked"
+                or age_days(e) > STALE_DAYS]
+
+    keyless = [e for e in rows if not e.get("ticket") and not e.get("pr")]
+
+    def shows_text(entry):
+        return BRIEF_REMOTE_TEXT or entry["id"] in mine_ids
+
+    out = ["[logbook] open items"]
+    if mine:
+        out.append("  %s:" % ticket)
+        out.extend(format_entry(e, verbose=True) for e in mine)
+    if escalate:
+        out.append("  blocked or stale elsewhere:")
+        out.extend(format_entry(e, text=shows_text(e)) for e in escalate)
+    if expired:
+        out.append("  followups past %d days, promote to %s or drop:"
+                   % (FOLLOWUP_EXPIRY_DAYS, TRACKER_NAME))
+        out.extend(format_entry(e, text=shows_text(e)) for e in expired)
+    if any(not shows_text(e) for e in escalate + expired):
+        out.append("  other tickets' text withheld: logbook show <id>")
+
+    # others already excludes expired, so they must not be subtracted twice
+    remaining = len(others) - len(escalate)
+    if remaining > 0:
+        out.append("  %d more open elsewhere: logbook ls --all"
+                   % remaining)
+    if keyless:
+        out.append("  %d keyless, attach a ticket: logbook ls --all"
+                   % len(keyless))
+    print("\n".join(out))
+    return 0
+
+
+def config_findings():
+    """Warnings a user can act on, worst first."""
+    findings = list(CONFIG_SOURCE["warnings"])
+    if CONFIG_SOURCE["fatal"]:
+        findings.insert(0, CONFIG_SOURCE["fatal"])
+    for kind, spec in CFG["kinds"].items():
+        requires = spec.get("requires")
+        if requires is not None and not isinstance(requires, list):
+            # a string here makes SHAPE the tuple of its characters, so
+            # the kind demands one field per letter
+            findings.append(
+                "kind %r has a non-list requires, so it asks for one "
+                "field per character" % kind)
+        for name in (requires if isinstance(requires, list) else ()):
+            if name in LOG_KEYS:
+                findings.append(
+                    "kind %r requires %r, which the log owns and no flag "
+                    "can set, so it can never be written" % (kind, name))
+        if not spec.get("requires"):
+            findings.append(
+                "kind %r requires nothing: it cannot refuse anything" % kind)
+        if spec.get("capped") and "ticket" not in (spec.get("requires") or ()):
+            findings.append(
+                "kind %r is capped but does not require a ticket, so every "
+                "entry shares one cap" % kind)
+    # four behaviours key off the built-in names. Renaming or dropping
+    # a kind silently switches its behaviour off, and the thresholds
+    # doctor prints above then apply to nothing.
+    keyed = (("followup", "thresholds.followup_expiry_days expires it"),
+             ("blocked", "the brief escalates it from other repos"),
+             ("deploy", "add fills in the commit, and deploy-sync "
+                        "resolves it"))
+    for name, behaviour in keyed:
+        if name not in CFG["kinds"]:
+            findings.append(
+                "no %r kind is declared, so nothing uses the behaviour "
+                "keyed to that name: %s" % (name, behaviour))
+    if not BLOCKING_KINDS:
+        findings.append(
+            "no declared kind blocks: close-out holds only for kinds that "
+            "are not declared at all")
+    custom = [k for k in CFG["kinds"] if k not in DEFAULTS["kinds"]]
+    if custom:
+        findings.append(
+            "custom kinds %s: the shape check is advisory for these, a "
+            "three-character value satisfies it" % ", ".join(sorted(custom)))
+    patterns = GATE.get("pr_close_patterns")
+    if patterns is None or not patterns:
+        findings.append(
+            "gate.pr_close_patterns is empty, so no PR close is ever held")
+    else:
+        for index, raw in enumerate(patterns):
+            try:
+                re.compile(raw)
+            except re.error as exc:
+                # skipped silently by the gate, so a typo disarmed it
+                findings.append(
+                    "gate.pr_close_patterns[%d] does not compile, so the "
+                    "gate ignores it: %s" % (index, exc))
+    if (GATE.get("tracker_tools") or []) and not (
+            GATE.get("done_words") or []):
+        findings.append(
+            "gate.done_words is empty while tracker_tools is set, so no "
+            "transition is ever recognised as a close")
+    if not pattern_normalises(CFG["ticket"]["pattern"]):
+        findings.append(
+            "ticket.pattern has no '-': keys are normalised as "
+            "PREFIX-NUMBER and this pattern will not normalise")
+    if DEPLOY.get("stages"):
+        ok, why = resolvers_enabled()
+        if not ok:
+            findings.append(
+                "deploy.stages is configured but resolvers will not run: "
+                "%s" % why)
+    for stage, spec in (DEPLOY.get("stages") or {}).items():
+        if "resolve" in spec and "exists" in spec:
+            findings.append(
+                "stage %r has both resolve and exists: cannot tell a commit "
+                "obligation from a teardown, so it holds" % stage)
+    retire_wired = any(RETIRE.get(k) for k in RETIRE_KEYS)
+    if retire_wired:
+        ok, why = resolvers_enabled()
+        if not ok:
+            findings.append(
+                "retire.ticket or retire.pr is configured but resolvers "
+                "will not run: %s" % why)
+    for kind in RETIRE.get("kinds") or []:
+        if kind not in CFG["kinds"]:
+            findings.append(
+                "retire.kinds names %r, which is not a declared kind, so "
+                "retire never touches it" % kind)
+        elif is_blocking(kind):
+            findings.append(
+                "retire.kinds names %r, which blocks close-out: a closed "
+                "ticket does not mean the obligation was met, so retire "
+                "refuses it" % kind)
+    if retire_wired and not retirable_kinds():
+        findings.append(
+            "retire is wired but retire.kinds leaves nothing retirable")
+    return findings
+
+
+SETTINGS_PATH = "~/.claude/settings.json"
+
+
+def gate_findings():
+    """Warn when tracker gating is configured but nothing invokes it."""
+    declared = GATE.get("tracker_tools") or []
+    tools = [t.get("tool") for t in declared
+             if isinstance(t, dict) and t.get("tool")]
+    # the hook reads spec["tool"] and fails open on the exception, so an
+    # entry of the wrong shape gates nothing and says nothing
+    malformed = ["%r" % (t,) for t in declared
+                 if not isinstance(t, dict) or not t.get("tool")]
+    shape = []
+    if malformed:
+        shape.append(
+            "gate.tracker_tools entries must be an object naming a tool, "
+            "so %s gates nothing. Give each one {\"tool\": \"...\"}"
+            % ", ".join(malformed))
+    if not tools:
+        return shape
+    path = os.path.expanduser(SETTINGS_PATH)
+    wired = False
+    try:
+        with open(path) as fh:
+            settings = json.load(fh)
+    except OSError:
+        # absent settings means nothing is wired, which is the finding
+        settings = {}
+    except ValueError as exc:
+        return shape + ["[logbook] tracker gating configured for %s but %s "
+                        "could not be parsed, so whether the gate runs is "
+                        "unknown: %s"
+                        % (", ".join(tools), SETTINGS_PATH, exc)]
+    ungated = list(tools)
+    try:
+        for group in (settings.get("hooks") or {}).get("PreToolUse") or []:
+            matcher = str(group.get("matcher") or "")
+            runs_gate = False
+            for hook in group.get("hooks") or []:
+                command = str(hook.get("command") or "")
+                if "binnacle" in command or "logbook-gate" in command:
+                    runs_gate = True
+            if not runs_gate:
+                continue
+            # a group that runs the gate but whose matcher never selects
+            # the tracker tool gates nothing for it, so both must hold
+            try:
+                pattern = re.compile(matcher)
+            except re.error:
+                continue
+            ungated = [t for t in ungated if not pattern.search(t)]
+    except (AttributeError, TypeError):
+        return shape + ["[logbook] tracker gating configured for %s but %s "
+                        "has an unexpected shape, so whether the gate runs "
+                        "is unknown" % (", ".join(tools), SETTINGS_PATH)]
+
+    findings = list(shape)
+    if ungated:
+        findings.append(
+            "[logbook] tracker gating configured for %s but no PreToolUse "
+            "hook both runs the gate and matches %s. Run `logbook doctor "
+            "--fix`, then add to %s: PreToolUse matcher %s running %s"
+            % (", ".join(ungated), "it" if len(ungated) == 1 else "them",
+               SETTINGS_PATH, "|".join(ungated), stable_gate_path()))
+
+    # the copy is what settings.json runs, so its own health is the
+    # thing to report, not whether some file exists at the path
+    copy = stable_gate_path()
+    if not os.path.exists(copy):
+        findings.append(
+            "[logbook] the gate copy at %s is missing. Run `logbook "
+            "doctor --fix`." % copy)
+    else:
+        root_file = os.path.join(os.path.dirname(copy), "plugin-root")
+        tool = None
+        try:
+            with open(root_file) as fh:
+                tool = os.path.join(fh.read().strip(), "bin", "logbook")
+        except OSError:
+            findings.append(
+                "[logbook] the gate copy at %s has no plugin-root beside "
+                "it, so it cannot find the tool and will pass every "
+                "transition silently. Run `logbook doctor --fix`." % copy)
+        if tool and not os.path.exists(tool):
+            findings.append(
+                "[logbook] the gate copy at %s points at %s, which does "
+                "not exist, so it will pass every transition silently. "
+                "Run `logbook doctor --fix`." % (copy, tool))
+    return findings
+
+
+def stable_gate_path():
+    """Gate copy under the plugin data dir, which survives updates.
+
+    The cache path carries a version and is swept after an update, so
+    settings.json cannot point into it. CLAUDE_PLUGIN_DATA persists;
+    the brief refreshes the copy there every session, so a plugin
+    update heals the path on its own.
+    """
+    data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    if not data:
+        data = os.path.expanduser("~/.claude/plugins/data/binnacle")
+    return os.path.join(data, "gate")
+
+
+def refresh_gate_copy(source):
+    """Copy the gate to the stable path, with the root it came from.
+
+    Returns the path, or a string describing why it could not be
+    written. The copy sits flat, so it cannot derive the plugin root
+    from its own location; `plugin-root` beside it carries that.
+    """
+    target = stable_gate_path()
+    # account_home, not expanduser: the target derives from HOME too, so
+    # a HOME-based boundary moves with it and always passes
+    home = account_home()
+    if not os.path.realpath(target).startswith(home + os.sep):
+        return "refusing to write the gate copy outside home: %s" % target
+    try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(source) as src:
+            body = src.read()
+        root = os.path.dirname(os.path.dirname(os.path.abspath(source)))
+        sidecar = os.path.join(os.path.dirname(target), "plugin-root")
+        for path, text, mode in ((target, body, 0o755),
+                                 (sidecar, root + "\n", 0o644)):
+            # written to a sibling and moved into place: truncating a
+            # live gate lets a concurrent hook execute a partial file,
+            # and O_NOFOLLOW stops a planted symlink redirecting it
+            tmp = path + ".tmp"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+            fd = os.open(tmp, flags, mode)
+            try:
+                os.write(fd, text.encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+    except OSError as exc:
+        return "could not write the gate copy: %s" % exc
+    return target
+    return target
+
+
+def cmd_doctor(args):
+    print("config: %s (%s)"
+          % (CONFIG_SOURCE["path"],
+             "loaded" if CONFIG_SOURCE["loaded"] else "not present"))
+    for key in sorted(CONFIG_SOURCE["origin"]):
+        print("  %-12s %s" % (key, CONFIG_SOURCE["origin"][key]))
+    print("store: %s" % LOG)
+    print("kinds: %s" % ", ".join(sorted(KINDS)))
+    print("blocking: %s" % (", ".join(sorted(BLOCKING_KINDS)) or "(none)"))
+    print("thresholds: followup_cap=%d followup_expiry_days=%d "
+          "stale_days=%d"
+          % (FOLLOWUP_CAP, FOLLOWUP_EXPIRY_DAYS, STALE_DAYS))
+    findings = config_findings()
+    # the copy is written before the gate is examined, so a finding the
+    # write settles is simply never raised. Filtering afterwards on the
+    # words "doctor --fix" also swallowed the settings.json instruction,
+    # which --fix does not do and which is the whole rest of the job.
+    fix_finding = None
+    if args.fix:
+        plugin_root = os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))
+        source = os.path.join(plugin_root, "hooks", "logbook-gate.py")
+        if not os.path.exists(source):
+            fix_finding = ("[logbook] --fix cannot find the gate at %s, so "
+                           "the copy was not written" % source)
+        else:
+            target = refresh_gate_copy(source)
+            # a failure here leaves settings.json pointing at nothing, so
+            # it is a finding rather than a silent no-op
+            if target == stable_gate_path():
+                print("gate copy: %s" % target)
+            else:
+                fix_finding = "[logbook] %s" % target
+    findings.extend(gate_findings())
+    if fix_finding:
+        findings.append(fix_finding)
+    if not findings:
+        print("no findings")
+        return 0
+    print("findings:")
+    for finding in findings:
+        print("  %s" % finding)
+    return 0
+
+
+def cmd_gate_check(args):
+    for finding in gate_findings():
+        print(finding)
+    return 0
+
+
+SHA = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def stage_spec(stage):
+    """Exact stage name, then glob, then the * default."""
+    stages = DEPLOY.get("stages") or {}
+    if stage in stages:
+        return stages[stage]
+    for pattern in sorted(stages):
+        if pattern == "*":
+            continue
+        if fnmatch.fnmatch(stage or "", pattern):
+            return stages[pattern]
+    return stages.get("*")
+
+
+def account_home():
+    """The account's own home, not whatever HOME currently says.
+
+    A repo that can set HOME could otherwise nominate itself as home
+    and have its own config trusted.
+    """
+    try:
+        import pwd
+        return os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        return os.path.realpath(os.path.expanduser("~"))
+
+
+def default_config_path():
+    return os.path.join(account_home(), ".claude", "binnacle",
+                        "logbook.json")
+
+
+def resolvers_enabled():
+    """Resolver commands run only from the config at the default path.
+
+    These are shell strings, so the question is not whether the file
+    looks trustworthy but whether anything other than the account
+    itself could have chosen it. Every softer signal is forgeable by
+    whoever supplies the config: HOME can be repointed at a checkout,
+    LOGBOOK_CONFIG can name a file a repo ships, a `..` path can leave
+    home while still reading as under it, and an opt-in key inside the
+    file is written by the same hand as the commands.
+
+    One rule instead: the config's real path must be the default one
+    under the account's own home. Nothing a repo sets can move that.
+    """
+    raw = CONFIG_SOURCE["path"]
+    if os.path.realpath(raw) != default_config_path():
+        return False, ("resolvers run only from %s, not %s"
+                       % (default_config_path(), raw))
+    return True, ""
+
+
+# handed to the resolver, since the whole environment would give it
+# every credential in the session when it needs a handful of values
+ENV_PASSED = ("PATH", "HOME", "LANG", "LC_ALL", "TZ", "TERM", "SHELL",
+              "USER", "LOGNAME", "TMPDIR")
+
+
+def resolver_env(entry, section=None):
+    section = DEPLOY if section is None else section
+    env = dict((k, os.environ[k]) for k in ENV_PASSED if k in os.environ)
+    for extra in section.get("env_passthrough") or []:
+        if extra in os.environ:
+            env[extra] = os.environ[extra]
+    env.update({
+        "LOGBOOK_STAGE": str(entry.get("stage") or ""),
+        "LOGBOOK_SERVICE": str(entry.get("service") or ""),
+        "LOGBOOK_COMMIT": str(entry.get("commit") or ""),
+        "LOGBOOK_TICKET": str(entry.get("ticket") or ""),
+        "LOGBOOK_PR": str(entry.get("pr") or ""),
+        "LOGBOOK_REPO": str(entry.get("repo") or ""),
+        "LOGBOOK_REPO_PATH": str(entry.get("repo_path") or ""),
+        "LOGBOOK_ENTRY_ID": str(entry.get("id") or ""),
+        "LOGBOOK_CONFIG_DIR": os.path.dirname(CONFIG_SOURCE["path"]),
+    })
+    return env
+
+
+def run_resolver(command, entry, section=None):
+    """(returncode, stdout). returncode None means it could not run.
+
+    On timeout the whole process group is signalled. subprocess.run
+    only kills the shell it started, so a resolver that pipes through
+    another command left the far side running - and with
+    start_new_session it was detached from the terminal too, so the
+    user's own Ctrl-C could not reach it either. A paging AWS loop
+    against a slow region leaked one process per sync, each holding
+    cloud credentials.
+    """
+    section = DEPLOY if section is None else section
+    timeout = section.get("timeout_seconds") or 60
+    try:
+        proc = subprocess.Popen(
+            command, shell=True, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
+            start_new_session=True, env=resolver_env(entry, section))
+    except (OSError, ValueError):
+        return None, ""
+    try:
+        # capped: an unbounded read buffers whatever the resolver
+        # prints for the whole timeout window, and one word is wanted
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        kill_group(proc)
+        return None, ""
+    except (OSError, ValueError):
+        kill_group(proc)
+        return None, ""
+    return proc.returncode, (out or "")[:MAX_RESOLVER_OUTPUT]
+
+
+def kill_group(proc):
+    """Signal the whole group, then reap it."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (OSError, ProcessLookupError):
+            break
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def resolve_commit(entry):
+    spec = stage_spec(entry.get("stage")) or {}
+    command = spec.get("resolve")
+    if not command:
+        return None
+    code, out = run_resolver(command, entry)
+    if code != 0:
+        return None
+    tokens = out.split(None, 1)
+    token = tokens[0].lower() if tokens else ""
+    return token if SHA.match(token) else None
+
+
+def stage_up(entry):
+    """True up, False definitely gone, None could not determine."""
+    spec = stage_spec(entry.get("stage")) or {}
+    command = spec.get("exists")
+    if not command:
+        return None
+    code, _ = run_resolver(command, entry)
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
+def is_ancestor(commit, deployed, cwd=None):
+    """True contains it, False definitely not, None cannot tell.
+
+    Every other branch of deploy-sync distinguishes a hold from a
+    negative; this one collapsed them, so "git could not answer" read
+    as "not deployed". Worse, it ran wherever the process happened to
+    be: from an unrelated clone that shares history the ancestry can
+    succeed and resolve a deploy obligation on the wrong repository's
+    evidence.
+    """
+    if not commit or not deployed:
+        return None
+    try:
+        out = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", commit, deployed],
+            cwd=cwd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode == 0:
+        return True
+    if out.returncode == 1:
+        return False
+    # 128 and friends: not a repo, unknown object, bad cwd
+    return None
+
+
+def cmd_deploy_sync(args, fetch=resolve_commit, exists=stage_up,
+                    ancestor=is_ancestor):
+    entries = replay(read_events())
+    rows = [e for e in active(entries) if e.get("kind") == "deploy"]
+    if args.ticket:
+        want = infer_ticket(str(args.ticket)) or args.ticket
+        rows = [e for e in rows if e.get("ticket") == want]
+    if not rows:
+        print("no open deploy obligations")
+        return 0
+
+    enabled, reason = resolvers_enabled()
+    if not enabled:
+        print("resolvers disabled: %s" % reason)
+        return 0
+
+    for entry in rows:
+        stage = entry.get("stage")
+        spec = stage_spec(stage) or {}
+        if "resolve" in spec and "exists" in spec:
+            print("%s  %s: both resolve and exists configured, holding"
+                  % (entry["id"], stage))
+            continue
+        if "exists" in spec:
+            up = exists(entry)
+            if up is None:
+                print("%s  %s: could not determine, holding"
+                      % (entry["id"], stage))
+            elif up:
+                print("%s  %s still up, teardown owed"
+                      % (entry["id"], stage))
+            else:
+                print("%s  %s is gone, %s" % (entry["id"], stage,
+                      "would resolve" if args.dry_run else "resolving"))
+                if not args.dry_run:
+                    append({"op": "resolve", "id": entry["id"],
+                            "ts": now_iso(),
+                            "note": "stage %s no longer exists" % stage})
+            continue
+        if "resolve" not in spec:
+            print("%s  no resolver configured for stage %s - add one to "
+                  "deploy.stages" % (entry["id"], stage))
+            continue
+        deployed = fetch(entry)
+        if not deployed:
+            print("%s  %s/%s: could not determine, holding"
+                  % (entry["id"], entry.get("service"), stage))
+            continue
+        held = ancestor(entry.get("commit"), deployed,
+                        entry.get("repo_path"))
+        if held is None:
+            print("%s  %s/%s: cannot compare commits from here, holding"
+                  % (entry["id"], entry.get("service"), stage))
+            continue
+        if not held:
+            print("%s  %s/%s: %s does NOT have this commit, still owed"
+                  % (entry["id"], entry.get("service"), stage, stage))
+            continue
+        print("%s  %s/%s: already deployed, %s"
+              % (entry["id"], entry.get("service"), stage,
+                 "would resolve" if args.dry_run else "resolving"))
+        if not args.dry_run:
+            append({"op": "resolve", "id": entry["id"], "ts": now_iso(),
+                    "note": "%s at %s contains this commit"
+                            % (stage, deployed[:12])})
+    return 0
+
+
+RETIRE_KEYS = ("ticket", "pr")
+
+
+def key_closed(entry, key):
+    """True closed, False still open, None could not determine.
+
+    Same tri-state as stage_up, same reason: "closed" has to be a
+    positive finding. An expired token or a tracker outage exits with
+    something other than 0 or 1, and that must hold the entry rather
+    than retire it.
+    """
+    command = RETIRE.get(key)
+    if not command:
+        return None
+    code, _ = run_resolver(command, entry, RETIRE)
+    if code == 0:
+        return True
+    if code == 1:
+        return False
+    return None
+
+
+def retirable_kinds():
+    """Kinds retire may touch: declared non-blocking, and named in config.
+
+    A blocking kind is an obligation a person meets; the tracker closing
+    says nothing about whether it was met, so config cannot opt one in.
+    """
+    wanted = RETIRE.get("kinds") or []
+    return frozenset(k for k in wanted if k in CFG["kinds"]
+                     and not is_blocking(k))
+
+
+def parse_closed(raw):
+    """--closed tokens: ticket keys and bare PR numbers, or an error.
+
+    A token that is neither is refused rather than skipped, because a
+    typo in a key the caller meant to close would otherwise hold that
+    entry silently and the caller would read the hold as evidence.
+    """
+    tickets, prs, bad = set(), set(), []
+    for token in (t.strip() for t in ",".join(raw or []).split(",")):
+        if not token:
+            continue
+        if token.isdigit():
+            prs.add(int(token))
+            continue
+        key = infer_ticket(token)
+        if key and key == token.upper():
+            tickets.add(key)
+        else:
+            bad.append(token)
+    return tickets, prs, bad
+
+
+def asserted(entry, key, tickets, prs):
+    if key == "ticket":
+        return entry.get("ticket") in tickets
+    return entry.get("pr") in prs
+
+
+def cmd_retire(args, closed=key_closed):
+    entries = replay(read_events())
+    kinds = retirable_kinds()
+    rows = [e for e in active(entries) if e.get("kind") in kinds]
+    if args.ticket:
+        want = infer_ticket(str(args.ticket)) or args.ticket
+        rows = [e for e in rows if e.get("ticket") == want]
+    tickets, prs, bad = parse_closed(getattr(args, "closed", None))
+    if bad:
+        print("--closed: not a ticket key like %s or a PR number: %s"
+              % (TICKET_EXAMPLE, ", ".join(bad)), file=sys.stderr)
+        return 2
+    if tickets or prs:
+        rows = [e for e in rows
+                if e.get("ticket") in tickets or e.get("pr") in prs]
+    if not rows:
+        print("no open entries of a retirable kind")
+        return 0
+
+    # asserted verdicts execute nothing, so they need no boundary; the
+    # resolver path keeps its own and is only consulted for keys the
+    # caller did not vouch for
+    enabled, reason = resolvers_enabled()
+
+    for entry in rows:
+        present = [k for k in RETIRE_KEYS if entry.get(k)]
+        if not present:
+            print("%s  no ticket or pr, holding" % entry["id"])
+            continue
+        to_ask = [k for k in present
+                  if not asserted(entry, k, tickets, prs)]
+        if to_ask and not enabled:
+            print("%s  resolvers disabled, holding: %s"
+                  % (entry["id"], reason))
+            continue
+        missing = [k for k in to_ask if not RETIRE.get(k)]
+        if missing:
+            print("%s  no resolver configured for %s - add retire.%s "
+                  "or pass --closed" % (entry["id"], ", ".join(missing),
+                                        missing[0]))
+            continue
+        verdicts = dict((k, True) for k in present if k not in to_ask)
+        verdicts.update((k, closed(entry, k)) for k in to_ask)
+        label = ", ".join("%s %s%s" % (k, entry[k],
+                                       "" if k in to_ask else " (asserted)")
+                          for k in present)
+        if any(v is None for v in verdicts.values()):
+            print("%s  %s: could not determine, holding"
+                  % (entry["id"], label))
+            continue
+        still_open = [k for k, v in verdicts.items() if not v]
+        if still_open:
+            print("%s  %s: %s still open, keeping"
+                  % (entry["id"], label, ", ".join(still_open)))
+            continue
+        print("%s  %s: closed, %s"
+              % (entry["id"], label,
+                 "would drop" if args.dry_run else "dropping"))
+        if not args.dry_run:
+            append({"op": "drop", "id": entry["id"], "ts": now_iso(),
+                    "note": "retired: %s closed" % label})
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="logbook")
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    add = sub.add_parser("add", help="record an obligation")
+    add.add_argument("--kind", required=True, choices=KINDS)
+    add.add_argument("--text", required=True)
+    add.add_argument("--why")
+    add.add_argument("--ticket")
+    add.add_argument("--pr", type=int)
+    add.add_argument("--stage")
+    add.add_argument("--service")
+    add.add_argument("--commit")
+    add.add_argument("--verify")
+    add.add_argument("--resume")
+    add.add_argument("--unblocked-by", dest="unblocked_by")
+    add.add_argument("--session")
+    add.add_argument("--field", action="append", default=[],
+                     metavar="NAME=VALUE",
+                     help="any field, including a custom kind's own")
+    add.set_defaults(func=cmd_add)
+
+    listing = sub.add_parser("ls", help="open entries")
+    listing.add_argument("--ticket")
+    listing.add_argument("--repo")
+    listing.add_argument("--kind", choices=KINDS)
+    listing.add_argument("--all", action="store_true",
+                         help="include resolved and dropped")
+    listing.add_argument("--json", action="store_true")
+    listing.set_defaults(func=cmd_ls)
+
+    show = sub.add_parser("show", help="full history for ticket, pr, or id")
+    show.add_argument("key")
+    show.set_defaults(func=cmd_show)
+
+    for name, func in (("resolve", cmd_resolve), ("drop", cmd_drop)):
+        closer = sub.add_parser(name)
+        closer.add_argument("id")
+        closer.add_argument("--note")
+        closer.set_defaults(func=func)
+
+    check = sub.add_parser("check", help="close-out gate")
+    check.add_argument("--ticket")
+    check.add_argument("--pr", type=int)
+    check.add_argument("--json", action="store_true")
+    check.set_defaults(func=cmd_check)
+
+    stale = sub.add_parser("stale", help="entries untouched for N days")
+    stale.add_argument("--days", type=int, default=STALE_DAYS)
+    stale.set_defaults(func=cmd_stale)
+
+    brief = sub.add_parser("brief", help="SessionStart injection")
+    brief.add_argument("--ticket")
+    brief.set_defaults(func=cmd_brief)
+
+    sync = sub.add_parser("deploy-sync",
+                          help="resolve deploy obligations already shipped")
+    sync.add_argument("--ticket")
+    sync.add_argument("--dry-run", action="store_true")
+    sync.set_defaults(func=cmd_deploy_sync)
+
+    retire = sub.add_parser("retire",
+                            help="drop non-blocking entries whose ticket "
+                                 "and PR are both closed")
+    retire.add_argument("--ticket")
+    retire.add_argument("--closed", action="append", default=[],
+                        metavar="KEY,KEY,N",
+                        help="ticket keys and PR numbers the caller has "
+                             "already confirmed closed; entries carrying "
+                             "them retire without running a resolver")
+    retire.add_argument("--dry-run", action="store_true")
+    retire.set_defaults(func=cmd_retire)
+
+    doctor = sub.add_parser("doctor", help="explain the effective config")
+    doctor.add_argument("--fix", action="store_true",
+                        help="refresh the stable gate copy for tracker "
+                             "gating")
+    doctor.set_defaults(func=cmd_doctor)
+
+    gate_check = sub.add_parser("gate-check",
+                                help="warn if tracker gating is unwired")
+    gate_check.set_defaults(func=cmd_gate_check)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if CONFIG_SOURCE["fatal"] and args.cmd != "doctor":
+        print("refused: %s" % CONFIG_SOURCE["fatal"], file=sys.stderr)
+        print("run `logbook doctor` for details", file=sys.stderr)
+        return 4
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

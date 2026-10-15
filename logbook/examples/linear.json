@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "ticket": { "pattern": "[A-Z]{2,6}-\\d{1,7}", "example": "ENG-42",
+              "tracker_name": "Linear" },
+  "gate": {
+    "tracker_tools": [
+      { "tool": "mcp__linear__update_issue",
+        "issue_field": "id",
+        "status_path": "state" }
+    ]
+  }
+}
